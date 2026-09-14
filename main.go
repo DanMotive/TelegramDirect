@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -13,10 +14,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+const albumCollectDelay = 900 * time.Millisecond
 
 type Config struct {
 	BotToken    string
@@ -48,44 +52,54 @@ type BotTextConfig struct {
 }
 
 type SuggestionTextConfig struct {
-	AskText         string `json:"ask_text"`
-	ModeAnonymous   string `json:"mode_anonymous"`
-	ModeNamed       string `json:"mode_named"`
-	ModeSelected    string `json:"mode_selected"`
-	EmptyText       string `json:"empty_text"`
-	TooLongText     string `json:"too_long_text"`
-	SentText        string `json:"sent_text"`
-	NoModeText      string `json:"no_mode_text"`
-	CancelText      string `json:"cancel_text"`
-	AnonymousAuthor string `json:"anonymous_author"`
-	MaxLength       int    `json:"max_length"`
+	AskText              string `json:"ask_text"`
+	ModeAnonymous        string `json:"mode_anonymous"`
+	ModeNamed            string `json:"mode_named"`
+	ModeSelected         string `json:"mode_selected"`
+	EmptyText            string `json:"empty_text"`
+	TooLongText          string `json:"too_long_text"`
+	SentText             string `json:"sent_text"`
+	NoModeText           string `json:"no_mode_text"`
+	CancelText           string `json:"cancel_text"`
+	UnsupportedMediaText string `json:"unsupported_media_text"`
+	AnonymousAuthor      string `json:"anonymous_author"`
+	ReplyText            string `json:"reply_text"`
+	MaxLength            int    `json:"max_length"`
 }
 
 type ModerationTextConfig struct {
-	Title            string `json:"title"`
-	IDLabel          string `json:"id_label"`
-	AuthorLabel      string `json:"author_label"`
-	TextLabel        string `json:"text_label"`
-	AnonymousAuthor  string `json:"anonymous_author"`
-	NamedFallback    string `json:"named_fallback"`
-	ApproveButton    string `json:"approve_button"`
-	RejectButton     string `json:"reject_button"`
-	ApprovedLog      string `json:"approved_log"`
-	RejectedLog      string `json:"rejected_log"`
-	AlreadyProcessed string `json:"already_processed"`
-	NotFound         string `json:"not_found"`
-	InvalidID        string `json:"invalid_id"`
-	NoPermission     string `json:"no_permission"`
+	Title             string `json:"title"`
+	IDLabel           string `json:"id_label"`
+	AuthorLabel       string `json:"author_label"`
+	TextLabel         string `json:"text_label"`
+	MediaLabel        string `json:"media_label"`
+	AnonymousAuthor   string `json:"anonymous_author"`
+	AnonymousIDLabel  string `json:"anonymous_id_label"`
+	NamedFallback     string `json:"named_fallback"`
+	ApproveButton     string `json:"approve_button"`
+	RejectButton      string `json:"reject_button"`
+	ApprovedLog       string `json:"approved_log"`
+	RejectedLog       string `json:"rejected_log"`
+	AlreadyProcessed  string `json:"already_processed"`
+	NotFound          string `json:"not_found"`
+	InvalidID         string `json:"invalid_id"`
+	NoPermission      string `json:"no_permission"`
 	PublishedCallback string `json:"published_callback"`
 	RejectedCallback  string `json:"rejected_callback"`
+	ReplySentLog      string `json:"reply_sent_log"`
+	ReplyNotFound     string `json:"reply_not_found"`
+	ReplyEmpty        string `json:"reply_empty"`
+	ReplyFailed       string `json:"reply_failed"`
 }
 
 type ChannelTextConfig struct {
-	Header          string `json:"header"`
-	ShowID          bool   `json:"show_id"`
-	ShowAuthor      bool   `json:"show_author"`
-	AuthorPrefix    string `json:"author_prefix"`
-	AnonymousAuthor string `json:"anonymous_author"`
+	Header            string `json:"header"`
+	ShowID            bool   `json:"show_id"`
+	ShowAuthor        bool   `json:"show_author"`
+	ShowAnonymousID   bool   `json:"show_anonymous_id"`
+	AuthorPrefix      string `json:"author_prefix"`
+	AnonymousAuthor   string `json:"anonymous_author"`
+	AnonymousIDPrefix string `json:"anonymous_id_prefix"`
 }
 
 type AdminTextConfig struct {
@@ -122,11 +136,58 @@ type tgChat struct {
 	ID int64 `json:"id"`
 }
 
+type tgPhotoSize struct {
+	FileID   string `json:"file_id"`
+	FileSize int    `json:"file_size"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+}
+
+type tgVideo struct {
+	FileID string `json:"file_id"`
+}
+
+type tgDocument struct {
+	FileID string `json:"file_id"`
+}
+
+type tgAudio struct {
+	FileID string `json:"file_id"`
+}
+
+type tgVoice struct {
+	FileID string `json:"file_id"`
+}
+
+type tgVideoNote struct {
+	FileID string `json:"file_id"`
+}
+
+type tgAnimation struct {
+	FileID string `json:"file_id"`
+}
+
+type tgSticker struct {
+	FileID string `json:"file_id"`
+}
+
 type tgMessage struct {
-	MessageID int     `json:"message_id"`
-	From      *tgUser `json:"from"`
-	Chat      tgChat  `json:"chat"`
-	Text      string  `json:"text"`
+	MessageID      int        `json:"message_id"`
+	From           *tgUser    `json:"from"`
+	Chat           tgChat     `json:"chat"`
+	Text           string     `json:"text"`
+	Caption        string     `json:"caption"`
+	MediaGroupID   string     `json:"media_group_id"`
+	ReplyToMessage *tgMessage `json:"reply_to_message"`
+
+	Photo     []tgPhotoSize `json:"photo"`
+	Video     *tgVideo      `json:"video"`
+	Document  *tgDocument   `json:"document"`
+	Audio     *tgAudio      `json:"audio"`
+	Voice     *tgVoice      `json:"voice"`
+	VideoNote *tgVideoNote  `json:"video_note"`
+	Animation *tgAnimation  `json:"animation"`
+	Sticker   *tgSticker    `json:"sticker"`
 }
 
 type tgCallbackQuery struct {
@@ -137,15 +198,15 @@ type tgCallbackQuery struct {
 }
 
 type tgUpdate struct {
-	UpdateID      int               `json:"update_id"`
-	Message       *tgMessage        `json:"message"`
-	CallbackQuery *tgCallbackQuery  `json:"callback_query"`
+	UpdateID      int              `json:"update_id"`
+	Message       *tgMessage       `json:"message"`
+	CallbackQuery *tgCallbackQuery `json:"callback_query"`
 }
 
 type tgResponse[T any] struct {
-	OK          bool            `json:"ok"`
-	Result      T               `json:"result"`
-	Description string          `json:"description"`
+	OK          bool   `json:"ok"`
+	Result      T      `json:"result"`
+	Description string `json:"description"`
 }
 
 type Suggestion struct {
@@ -155,10 +216,27 @@ type Suggestion struct {
 	DisplayName   string
 	Text          string
 	Anonymous     bool
+	AnonymousID   string
 	Status        string
 	CreatedAt     time.Time
 	ReviewedBy    int64
 	ReviewMessage int
+}
+
+type pendingAlbum struct {
+	Messages []*tgMessage
+	Timer    *time.Timer
+}
+
+type AlbumCollector struct {
+	mu     sync.Mutex
+	albums map[string]*pendingAlbum
+}
+
+func NewAlbumCollector() *AlbumCollector {
+	return &AlbumCollector{
+		albums: make(map[string]*pendingAlbum),
+	}
 }
 
 func main() {
@@ -180,8 +258,10 @@ func main() {
 	}
 
 	api := &BotAPI{
-		Token:  cfg.BotToken,
-		Client: &http.Client{Timeout: 60 * time.Second},
+		Token: cfg.BotToken,
+		Client: &http.Client{
+			Timeout: 60 * time.Second,
+		},
 	}
 
 	ctx := context.Background()
@@ -191,12 +271,24 @@ func main() {
 		log.Fatal("telegram authentication failed: ", err)
 	}
 
-	log.Printf("bot started: @%s (%d)", me.Username, me.ID)
+	log.Printf(
+		"bot started: @%s (%d)",
+		me.Username,
+		me.ID,
+	)
+
+	collector := NewAlbumCollector()
 
 	var offset int
 
 	for {
-		updates, err := api.GetUpdates(ctx, offset, 50, 50)
+		updates, err := api.GetUpdates(
+			ctx,
+			offset,
+			50,
+			50,
+		)
+
 		if err != nil {
 			log.Printf("polling error: %v", err)
 			time.Sleep(3 * time.Second)
@@ -208,10 +300,103 @@ func main() {
 				offset = upd.UpdateID + 1
 			}
 
-			if err := handleUpdate(ctx, api, db, cfg, upd); err != nil {
-				log.Printf("update %d failed: %v", upd.UpdateID, err)
+			if err := handleUpdate(
+				ctx,
+				api,
+				db,
+				cfg,
+				collector,
+				upd,
+			); err != nil {
+				log.Printf(
+					"update %d failed: %v",
+					upd.UpdateID,
+					err,
+				)
 			}
 		}
+	}
+}
+
+func defaultTextConfig() TextConfig {
+	return TextConfig{
+		Bot: BotTextConfig{
+			Name:            "TelegramDirect",
+			WelcomeText:     "Hello! You can send a suggestion here.",
+			HelpText:        "Choose how you want to submit your suggestion.",
+			AnonymousButton: "🕵️ Anonymous",
+			NamedButton:     "👤 With my name",
+			CancelButton:    "❌ Cancel",
+			UnknownCommand:  "Use /suggest to send a suggestion.",
+		},
+
+		Suggestion: SuggestionTextConfig{
+			AskText:              "✍️ Now send your suggestion. Selected mode: %s.",
+			ModeAnonymous:        "anonymous",
+			ModeNamed:            "with my name",
+			ModeSelected:         "Mode: %s",
+			EmptyText:            "The suggestion cannot be empty.",
+			TooLongText:          "The suggestion is too long. Maximum: %d characters.",
+			SentText:             "✅ Your suggestion has been sent for moderation.",
+			NoModeText:           "First choose a submission mode using /suggest.",
+			CancelText:           "❌ Submission cancelled.",
+			UnsupportedMediaText: "❌ This type of media is not supported. GIFs and stickers are not allowed.",
+			AnonymousAuthor:      "Anonymous",
+			ReplyText:            "💬 Reply to your suggestion #%d:\n\n%s",
+			MaxLength:            4000,
+		},
+
+		Moderation: ModerationTextConfig{
+			Title:             "📩 New Suggestion",
+			IDLabel:           "ID",
+			AuthorLabel:       "Author",
+			TextLabel:         "Text",
+			MediaLabel:        "Attachments",
+			AnonymousAuthor:   "Anonymous",
+			AnonymousIDLabel:  "Anonymous ID",
+			NamedFallback:     "User without username",
+			ApproveButton:     "✅ Publish",
+			RejectButton:      "❌ Reject",
+			ApprovedLog:       "✅ Suggestion #%d was published by %s (ID %d).",
+			RejectedLog:       "❌ Suggestion #%d was rejected by %s (ID %d).",
+			AlreadyProcessed:  "This suggestion has already been processed.",
+			NotFound:          "Suggestion not found.",
+			InvalidID:         "Invalid suggestion ID.",
+			NoPermission:      "You do not have permission to do this.",
+			PublishedCallback: "Published",
+			RejectedCallback:  "Rejected",
+			ReplySentLog:      "💬 Reply to suggestion #%d was sent to %s by %s.",
+			ReplyNotFound:     "This message is not linked to a suggestion.",
+			ReplyEmpty:        "The reply cannot be empty.",
+			ReplyFailed:       "Failed to send the reply.",
+		},
+
+		Channel: ChannelTextConfig{
+			Header:            "📢 Suggestion",
+			ShowID:            false,
+			ShowAuthor:        true,
+			ShowAnonymousID:   false,
+			AuthorPrefix:      "👤 Author:",
+			AnonymousAuthor:   "Anonymous",
+			AnonymousIDPrefix: "🆔",
+		},
+
+		Admin: AdminTextConfig{
+			QueueTitle:   "📋 Suggestion Queue",
+			QueueItem:    "#%d — %s\n%s",
+			QueueEmpty:   "The queue is empty.",
+			HelpText:     "Commands:\n/queue — show the suggestion queue\n/help — show this help message",
+			PublishedLog: "✅ Suggestion #%d was published by %s (ID %d).",
+			RejectedLog:  "❌ Suggestion #%d was rejected by %s (ID %d).",
+		},
+
+		Errors: ErrorTextConfig{
+			Generic:       "Something went wrong. Please try again.",
+			NotAllowed:    "You do not have access to this action.",
+			Unavailable:   "This message is no longer available.",
+			InvalidAction: "Invalid action.",
+			InvalidMode:   "Invalid submission mode.",
+		},
 	}
 }
 
@@ -227,7 +412,10 @@ func loadConfig() (Config, error) {
 		64,
 	)
 	if err != nil {
-		return Config{}, fmt.Errorf("invalid ADMIN_CHAT_ID: %w", err)
+		return Config{}, fmt.Errorf(
+			"invalid ADMIN_CHAT_ID: %w",
+			err,
+		)
 	}
 
 	channelID, err := strconv.ParseInt(
@@ -236,12 +424,18 @@ func loadConfig() (Config, error) {
 		64,
 	)
 	if err != nil {
-		return Config{}, fmt.Errorf("invalid CHANNEL_ID: %w", err)
+		return Config{}, fmt.Errorf(
+			"invalid CHANNEL_ID: %w",
+			err,
+		)
 	}
 
 	adminIDs := make(map[int64]bool)
 
-	for _, raw := range strings.Split(os.Getenv("ADMIN_IDS"), ",") {
+	for _, raw := range strings.Split(
+		os.Getenv("ADMIN_IDS"),
+		",",
+	) {
 		raw = strings.TrimSpace(raw)
 
 		if raw == "" {
@@ -250,14 +444,20 @@ func loadConfig() (Config, error) {
 
 		id, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
-			return Config{}, fmt.Errorf("invalid admin ID %q: %w", raw, err)
+			return Config{}, fmt.Errorf(
+				"invalid admin ID %q: %w",
+				raw,
+				err,
+			)
 		}
 
 		adminIDs[id] = true
 	}
 
 	if len(adminIDs) == 0 {
-		return Config{}, errors.New("ADMIN_IDS must contain at least one Telegram user ID")
+		return Config{}, errors.New(
+			"ADMIN_IDS must contain at least one Telegram user ID",
+		)
 	}
 
 	dbPath := strings.TrimSpace(os.Getenv("DB_PATH"))
@@ -265,7 +465,9 @@ func loadConfig() (Config, error) {
 		dbPath = "data.db"
 	}
 
-	configPath := strings.TrimSpace(os.Getenv("CONFIG_PATH"))
+	configPath := strings.TrimSpace(
+		os.Getenv("CONFIG_PATH"),
+	)
 	if configPath == "" {
 		configPath = "config.json"
 	}
@@ -287,15 +489,23 @@ func loadConfig() (Config, error) {
 }
 
 func loadTextConfig(path string) (TextConfig, error) {
+	cfg := defaultTextConfig()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return TextConfig{}, fmt.Errorf("failed to read config %s: %w", path, err)
+		return TextConfig{}, fmt.Errorf(
+			"failed to read config %s: %w",
+			path,
+			err,
+		)
 	}
 
-	var cfg TextConfig
-
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return TextConfig{}, fmt.Errorf("invalid JSON config %s: %w", path, err)
+		return TextConfig{}, fmt.Errorf(
+			"invalid JSON config %s: %w",
+			path,
+			err,
+		)
 	}
 
 	if cfg.Suggestion.MaxLength <= 0 {
@@ -316,6 +526,7 @@ func initDB(db *sql.DB) error {
 			display_name TEXT NOT NULL DEFAULT '',
 			text TEXT NOT NULL,
 			anonymous INTEGER NOT NULL DEFAULT 1,
+			anonymous_id TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'pending',
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			reviewed_by INTEGER NOT NULL DEFAULT 0,
@@ -330,9 +541,118 @@ func initDB(db *sql.DB) error {
 			mode INTEGER NOT NULL,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
+
+		CREATE TABLE IF NOT EXISTS anonymous_users (
+			user_id INTEGER PRIMARY KEY,
+			anonymous_id TEXT NOT NULL UNIQUE
+		);
+
+		CREATE TABLE IF NOT EXISTS suggestion_media (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			suggestion_id INTEGER NOT NULL,
+			source_chat_id INTEGER NOT NULL,
+			source_message_id INTEGER NOT NULL,
+			sort_order INTEGER NOT NULL DEFAULT 0,
+			FOREIGN KEY(suggestion_id) REFERENCES suggestions(id)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_suggestion_media_suggestion
+		ON suggestion_media(suggestion_id);
+
+		CREATE TABLE IF NOT EXISTS suggestion_messages (
+			message_id INTEGER PRIMARY KEY,
+			suggestion_id INTEGER NOT NULL,
+			FOREIGN KEY(suggestion_id) REFERENCES suggestions(id)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_suggestion_messages_suggestion
+		ON suggestion_messages(suggestion_id);
 	`)
 
-	return err
+	if err != nil {
+		return err
+	}
+
+	var columnCount int
+
+	err = db.QueryRow(`
+		SELECT COUNT(*)
+		FROM pragma_table_info('suggestions')
+		WHERE name='anonymous_id'
+	`).Scan(&columnCount)
+
+	if err != nil {
+		return err
+	}
+
+	if columnCount == 0 {
+		if _, err := db.Exec(`
+			ALTER TABLE suggestions
+			ADD COLUMN anonymous_id TEXT NOT NULL DEFAULT ''
+		`); err != nil {
+			return err
+		}
+	}
+
+	return migrateAnonymousIDs(db)
+}
+
+func migrateAnonymousIDs(db *sql.DB) error {
+	rows, err := db.Query(`
+		SELECT DISTINCT user_id
+		FROM suggestions
+		WHERE anonymous=1
+		AND anonymous_id=''
+	`)
+	if err != nil {
+		return err
+	}
+
+	defer rows.Close()
+
+	var userIDs []int64
+
+	for rows.Next() {
+		var userID int64
+
+		if err := rows.Scan(&userID); err != nil {
+			return err
+		}
+
+		userIDs = append(userIDs, userID)
+	}
+
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, userID := range userIDs {
+		anonymousID, err := ensureAnonymousID(
+			db,
+			userID,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		_, err = db.Exec(`
+			UPDATE suggestions
+			SET anonymous_id=?
+			WHERE user_id=?
+			AND anonymous=1
+			AND anonymous_id=''
+		`,
+			anonymousID,
+			userID,
+		)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func handleUpdate(
@@ -340,14 +660,28 @@ func handleUpdate(
 	api *BotAPI,
 	db *sql.DB,
 	cfg Config,
+	collector *AlbumCollector,
 	upd tgUpdate,
 ) error {
 	if upd.CallbackQuery != nil {
-		return handleCallback(ctx, api, db, cfg, upd.CallbackQuery)
+		return handleCallback(
+			ctx,
+			api,
+			db,
+			cfg,
+			upd.CallbackQuery,
+		)
 	}
 
 	if upd.Message != nil {
-		return handleMessage(ctx, api, db, cfg, upd.Message)
+		return handleMessage(
+			ctx,
+			api,
+			db,
+			cfg,
+			collector,
+			upd.Message,
+		)
 	}
 
 	return nil
@@ -358,14 +692,36 @@ func handleMessage(
 	api *BotAPI,
 	db *sql.DB,
 	cfg Config,
+	collector *AlbumCollector,
 	msg *tgMessage,
 ) error {
 	if msg.From == nil || msg.From.IsBot {
 		return nil
 	}
 
-	if msg.Chat.ID == cfg.AdminChatID && cfg.AdminIDs[msg.From.ID] {
-		return handleAdminMessage(ctx, api, db, cfg, msg)
+	if msg.Chat.ID == cfg.AdminChatID &&
+		cfg.AdminIDs[msg.From.ID] &&
+		msg.ReplyToMessage != nil {
+
+		return handleAdminReply(
+			ctx,
+			api,
+			db,
+			cfg,
+			msg,
+		)
+	}
+
+	if msg.Chat.ID == cfg.AdminChatID &&
+		cfg.AdminIDs[msg.From.ID] {
+
+		return handleAdminMessage(
+			ctx,
+			api,
+			db,
+			cfg,
+			msg,
+		)
 	}
 
 	if msg.Chat.ID != msg.From.ID {
@@ -381,6 +737,14 @@ func handleMessage(
 			cfg.Texts.Bot.WelcomeText,
 			cfg,
 		)
+
+	case "/help":
+		return api.SendMessage(
+			ctx,
+			msg.Chat.ID,
+			cfg.Texts.Bot.HelpText,
+			nil,
+		)
 	}
 
 	if strings.HasPrefix(msg.Text, "/") {
@@ -392,44 +756,92 @@ func handleMessage(
 		)
 	}
 
-	var mode int
-
-	err := db.QueryRow(
-		`SELECT mode FROM user_states WHERE user_id=?`,
-		msg.From.ID,
-	).Scan(&mode)
-
-	if err == sql.ErrNoRows {
+	if hasUnsupportedMedia(msg) {
 		return api.SendMessage(
 			ctx,
 			msg.Chat.ID,
-			cfg.Texts.Suggestion.NoModeText,
+			cfg.Texts.Suggestion.UnsupportedMediaText,
 			nil,
 		)
 	}
 
-	if err != nil {
-		return err
+	if msg.MediaGroupID != "" {
+		key := fmt.Sprintf(
+			"%d:%s",
+			msg.Chat.ID,
+			msg.MediaGroupID,
+		)
+
+		return collector.Add(
+			key,
+			msg,
+			func(messages []*tgMessage) {
+				flushAlbum(
+					ctx,
+					api,
+					db,
+					cfg,
+					messages,
+				)
+			},
+		)
 	}
 
-	if err := submitSuggestion(
+	if hasSupportedMedia(msg) {
+		return submitMediaSuggestion(
+			ctx,
+			api,
+			db,
+			cfg,
+			[]*tgMessage{msg},
+		)
+	}
+
+	return submitTextSuggestion(
 		ctx,
 		api,
 		db,
 		cfg,
 		*msg.From,
 		msg.Text,
-		mode == 1,
-	); err != nil {
-		return err
+	)
+}
+
+func flushAlbum(
+	ctx context.Context,
+	api *BotAPI,
+	db *sql.DB,
+	cfg Config,
+	messages []*tgMessage,
+) {
+	if len(messages) == 0 {
+		return
 	}
 
-	_, _ = db.Exec(
-		`DELETE FROM user_states WHERE user_id=?`,
-		msg.From.ID,
-	)
+	for _, msg := range messages {
+		if hasUnsupportedMedia(msg) {
+			_ = api.SendMessage(
+				ctx,
+				msg.Chat.ID,
+				cfg.Texts.Suggestion.UnsupportedMediaText,
+				nil,
+			)
+			return
+		}
+	}
 
-	return nil
+	if err := submitMediaSuggestion(
+		ctx,
+		api,
+		db,
+		cfg,
+		messages,
+	); err != nil {
+		log.Printf(
+			"album submission failed: %v",
+			err,
+		)
+	}
 }
 
 func handleAdminMessage(
@@ -454,6 +866,110 @@ func handleAdminMessage(
 	default:
 		return nil
 	}
+}
+
+func handleAdminReply(
+	ctx context.Context,
+	api *BotAPI,
+	db *sql.DB,
+	cfg Config,
+	msg *tgMessage,
+) error {
+	if msg.ReplyToMessage == nil {
+		return nil
+	}
+
+	var (
+		suggestionID int64
+		userID       int64
+	)
+
+	err := db.QueryRow(`
+		SELECT
+			s.id,
+			s.user_id
+		FROM suggestion_messages sm
+		JOIN suggestions s
+			ON s.id = sm.suggestion_id
+		WHERE sm.message_id=?
+	`,
+		msg.ReplyToMessage.MessageID,
+	).Scan(
+		&suggestionID,
+		&userID,
+	)
+
+	if err == sql.ErrNoRows {
+		return api.SendMessage(
+			ctx,
+			msg.Chat.ID,
+			cfg.Texts.Moderation.ReplyNotFound,
+			nil,
+		)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	if hasUnsupportedMedia(msg) {
+		return api.SendMessage(
+			ctx,
+			msg.Chat.ID,
+			cfg.Texts.Suggestion.UnsupportedMediaText,
+			nil,
+		)
+	}
+
+	if !hasMessageContent(msg) {
+		return api.SendMessage(
+			ctx,
+			msg.Chat.ID,
+			cfg.Texts.Moderation.ReplyEmpty,
+			nil,
+		)
+	}
+
+	_, err = api.CopyMessage(
+		ctx,
+		userID,
+		msg.Chat.ID,
+		msg.MessageID,
+	)
+
+	if err != nil {
+		_ = api.SendMessage(
+			ctx,
+			msg.Chat.ID,
+			cfg.Texts.Moderation.ReplyFailed,
+			nil,
+		)
+
+		return err
+	}
+
+	identifier, err := getSuggestionIdentifier(
+		db,
+		suggestionID,
+	)
+
+	if err != nil {
+		identifier = "user"
+	}
+
+	logText := fmt.Sprintf(
+		cfg.Texts.Moderation.ReplySentLog,
+		suggestionID,
+		identifier,
+		userLabel(*msg.From),
+	)
+
+	return api.SendMessage(
+		ctx,
+		msg.Chat.ID,
+		logText,
+		nil,
+	)
 }
 
 func handleCallback(
@@ -508,13 +1024,17 @@ func handleCallback(
 			DO UPDATE SET
 				mode=excluded.mode,
 				updated_at=CURRENT_TIMESTAMP
-		`, cb.From.ID, mode)
+		`,
+			cb.From.ID,
+			mode,
+		)
 
 		if err != nil {
 			return err
 		}
 
 		label := cfg.Texts.Suggestion.ModeAnonymous
+
 		if mode == 0 {
 			label = cfg.Texts.Suggestion.ModeNamed
 		}
@@ -522,7 +1042,10 @@ func handleCallback(
 		if err := api.AnswerCallbackQuery(
 			ctx,
 			cb.ID,
-			fmt.Sprintf(cfg.Texts.Suggestion.ModeSelected, label),
+			fmt.Sprintf(
+				cfg.Texts.Suggestion.ModeSelected,
+				label,
+			),
 		); err != nil {
 			return err
 		}
@@ -530,13 +1053,17 @@ func handleCallback(
 		return api.SendMessage(
 			ctx,
 			cb.From.ID,
-			fmt.Sprintf(cfg.Texts.Suggestion.AskText, label),
+			fmt.Sprintf(
+				cfg.Texts.Suggestion.AskText,
+				label,
+			),
 			nil,
 		)
 
 	case "approve":
 		if cb.Message.Chat.ID != cfg.AdminChatID ||
 			!cfg.AdminIDs[cb.From.ID] {
+
 			return api.AnswerCallbackQuery(
 				ctx,
 				cb.ID,
@@ -556,6 +1083,7 @@ func handleCallback(
 	case "reject":
 		if cb.Message.Chat.ID != cfg.AdminChatID ||
 			!cfg.AdminIDs[cb.From.ID] {
+
 			return api.AnswerCallbackQuery(
 				ctx,
 				cb.ID,
@@ -611,14 +1139,13 @@ func sendChoiceKeyboard(
 	)
 }
 
-func submitSuggestion(
+func submitTextSuggestion(
 	ctx context.Context,
 	api *BotAPI,
 	db *sql.DB,
 	cfg Config,
 	user tgUser,
 	text string,
-	anonymous bool,
 ) error {
 	text = strings.TrimSpace(text)
 
@@ -643,6 +1170,25 @@ func submitSuggestion(
 		)
 	}
 
+	mode, err := getUserMode(db, user.ID)
+	if err != nil {
+		return err
+	}
+
+	anonymous := mode == 1
+
+	anonymousID := ""
+
+	if anonymous {
+		anonymousID, err = ensureAnonymousID(
+			db,
+			user.ID,
+		)
+		if err != nil {
+			return err
+		}
+	}
+
 	displayName := strings.TrimSpace(
 		strings.Join(
 			[]string{
@@ -653,62 +1199,81 @@ func submitSuggestion(
 		),
 	)
 
-	_, err := db.Exec(`
+	result, err := db.Exec(`
 		INSERT INTO suggestions
-		(user_id, username, display_name, text, anonymous)
-		VALUES (?, ?, ?, ?, ?)
+		(
+			user_id,
+			username,
+			display_name,
+			text,
+			anonymous,
+			anonymous_id
+		)
+		VALUES (?, ?, ?, ?, ?, ?)
 	`,
 		user.ID,
 		user.Username,
 		displayName,
 		text,
 		boolInt(anonymous),
+		anonymousID,
 	)
 
 	if err != nil {
 		return err
 	}
 
-	var (
-		s       Suggestion
-		anonInt int
-	)
-
-	row := db.QueryRow(`
-		SELECT
-			id,
-			user_id,
-			username,
-			display_name,
-			text,
-			anonymous,
-			status,
-			created_at
-		FROM suggestions
-		ORDER BY id DESC
-		LIMIT 1
-	`)
-
-	if err := row.Scan(
-		&s.ID,
-		&s.UserID,
-		&s.Username,
-		&s.DisplayName,
-		&s.Text,
-		&anonInt,
-		&s.Status,
-		&s.CreatedAt,
-	); err != nil {
+	suggestionID, err := result.LastInsertId()
+	if err != nil {
 		return err
 	}
 
-	s.Anonymous = anonInt != 0
+	s, err := getSuggestion(
+		db,
+		suggestionID,
+	)
+	if err != nil {
+		return err
+	}
 
-	if _, err := sendModerationMessage(
+	reviewMessageID, err := sendModerationMessage(
 		ctx,
 		api,
 		cfg,
 		s,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(`
+		UPDATE suggestions
+		SET review_message=?
+		WHERE id=?
+	`,
+		reviewMessageID,
+		suggestionID,
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(`
+		INSERT OR REPLACE INTO suggestion_messages
+		(message_id, suggestion_id)
+		VALUES (?, ?)
+	`,
+		reviewMessageID,
+		suggestionID,
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(`
+		DELETE FROM user_states
+		WHERE user_id=?
+	`,
+		user.ID,
 	); err != nil {
 		return err
 	}
@@ -721,6 +1286,237 @@ func submitSuggestion(
 	)
 }
 
+func submitMediaSuggestion(
+	ctx context.Context,
+	api *BotAPI,
+	db *sql.DB,
+	cfg Config,
+	messages []*tgMessage,
+) error {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	user := messages[0].From
+
+	if user == nil {
+		return errors.New("media message has no author")
+	}
+
+	var textBuilder strings.Builder
+
+	for _, msg := range messages {
+		if msg.Caption != "" {
+			if textBuilder.Len() > 0 {
+				textBuilder.WriteString("\n\n")
+			}
+
+			textBuilder.WriteString(strings.TrimSpace(msg.Caption))
+		}
+	}
+
+	text := textBuilder.String()
+
+	if len([]rune(text)) > cfg.Texts.Suggestion.MaxLength {
+		return api.SendMessage(
+			ctx,
+			user.ID,
+			fmt.Sprintf(
+				cfg.Texts.Suggestion.TooLongText,
+				cfg.Texts.Suggestion.MaxLength,
+			),
+			nil,
+		)
+	}
+
+	mode, err := getUserMode(
+		db,
+		user.ID,
+	)
+	if err != nil {
+		return err
+	}
+
+	anonymous := mode == 1
+
+	anonymousID := ""
+
+	if anonymous {
+		anonymousID, err = ensureAnonymousID(
+			db,
+			user.ID,
+		)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	displayName := strings.TrimSpace(
+		strings.Join(
+			[]string{
+				user.FirstName,
+				user.LastName,
+			},
+			" ",
+		),
+	)
+
+	result, err := db.Exec(`
+		INSERT INTO suggestions
+		(
+			user_id,
+			username,
+			display_name,
+			text,
+			anonymous,
+			anonymous_id
+		)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`,
+		user.ID,
+		user.Username,
+		displayName,
+		text,
+		boolInt(anonymous),
+		anonymousID,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	suggestionID, err := result.LastInsertId()
+	if err != nil {
+		return err
+	}
+
+	s, err := getSuggestion(
+		db,
+		suggestionID,
+	)
+	if err != nil {
+		return err
+	}
+
+	reviewMessageID, err := sendModerationMessage(
+		ctx,
+		api,
+		cfg,
+		s,
+	)
+	if err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(`
+		UPDATE suggestions
+		SET review_message=?
+		WHERE id=?
+	`,
+		reviewMessageID,
+		suggestionID,
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.Exec(`
+		INSERT OR REPLACE INTO suggestion_messages
+		(message_id, suggestion_id)
+		VALUES (?, ?)
+	`,
+		reviewMessageID,
+		suggestionID,
+	); err != nil {
+		return err
+	}
+
+	for index, msg := range messages {
+		if _, err := db.Exec(`
+			INSERT INTO suggestion_media
+			(
+				suggestion_id,
+				source_chat_id,
+				source_message_id,
+				sort_order
+			)
+			VALUES (?, ?, ?, ?)
+		`,
+			suggestionID,
+			msg.Chat.ID,
+			msg.MessageID,
+			index,
+		); err != nil {
+			return err
+		}
+	}
+
+	for _, msg := range messages {
+		// The copied moderation media message must also be mapped
+		// so an administrator can reply to any attachment.
+		copied, err := api.CopyMessage(
+			ctx,
+			cfg.AdminChatID,
+			msg.Chat.ID,
+			msg.MessageID,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		if _, err := db.Exec(`
+			INSERT OR REPLACE INTO suggestion_messages
+			(message_id, suggestion_id)
+			VALUES (?, ?)
+		`,
+			copied.MessageID,
+			suggestionID,
+		); err != nil {
+			return err
+		}
+	}
+
+	if _, err := db.Exec(`
+		DELETE FROM user_states
+		WHERE user_id=?
+	`,
+		user.ID,
+	); err != nil {
+		return err
+	}
+
+	return api.SendMessage(
+		ctx,
+		user.ID,
+		cfg.Texts.Suggestion.SentText,
+		nil,
+	)
+}
+
+func getUserMode(
+	db *sql.DB,
+	userID int64,
+) (int, error) {
+	var mode int
+
+	err := db.QueryRow(`
+		SELECT mode
+		FROM user_states
+		WHERE user_id=?
+	`,
+		userID,
+	).Scan(&mode)
+
+	if err == sql.ErrNoRows {
+		return -1, errors.New(
+			"user has not selected a submission mode",
+		)
+	}
+
+	return mode, err
+}
+
 func sendModerationMessage(
 	ctx context.Context,
 	api *BotAPI,
@@ -728,22 +1524,50 @@ func sendModerationMessage(
 	s Suggestion,
 ) (int, error) {
 	author := formatSuggestionAuthor(
-		cfg,
 		s,
 		cfg.Texts.Moderation.AnonymousAuthor,
 		cfg.Texts.Moderation.NamedFallback,
 	)
 
-	text := fmt.Sprintf(
-		"%s\n\n%s: #%d\n%s: %s\n\n%s:\n%s",
-		cfg.Texts.Moderation.Title,
-		cfg.Texts.Moderation.IDLabel,
-		s.ID,
-		cfg.Texts.Moderation.AuthorLabel,
-		author,
-		cfg.Texts.Moderation.TextLabel,
-		s.Text,
+	var b strings.Builder
+
+	b.WriteString(cfg.Texts.Moderation.Title)
+	b.WriteString("\n\n")
+
+	b.WriteString(
+		fmt.Sprintf(
+			"%s: #%d\n",
+			cfg.Texts.Moderation.IDLabel,
+			s.ID,
+		),
 	)
+
+	b.WriteString(
+		fmt.Sprintf(
+			"%s: %s\n",
+			cfg.Texts.Moderation.AuthorLabel,
+			author,
+		),
+	)
+
+	if s.Anonymous && s.AnonymousID != "" {
+		b.WriteString(
+			fmt.Sprintf(
+				"%s: %s\n",
+				cfg.Texts.Moderation.AnonymousIDLabel,
+				s.AnonymousID,
+			),
+		)
+	}
+
+	if s.Text != "" {
+		b.WriteString("\n")
+		b.WriteString(
+			cfg.Texts.Moderation.TextLabel,
+		)
+		b.WriteString(":\n")
+		b.WriteString(s.Text)
+	}
 
 	markup := map[string]any{
 		"inline_keyboard": [][]map[string]string{
@@ -769,7 +1593,7 @@ func sendModerationMessage(
 	message, err := api.SendMessageWithResult(
 		ctx,
 		cfg.AdminChatID,
-		text,
+		b.String(),
 		markup,
 	)
 
@@ -788,7 +1612,11 @@ func approveSuggestion(
 	cb *tgCallbackQuery,
 	rawID string,
 ) error {
-	id, err := strconv.ParseInt(rawID, 10, 64)
+	id, err := strconv.ParseInt(
+		rawID,
+		10,
+		64,
+	)
 
 	if err != nil {
 		return api.AnswerCallbackQuery(
@@ -798,7 +1626,10 @@ func approveSuggestion(
 		)
 	}
 
-	s, err := getSuggestion(db, id)
+	s, err := getSuggestion(
+		db,
+		id,
+	)
 
 	if err != nil {
 		return api.AnswerCallbackQuery(
@@ -816,19 +1647,73 @@ func approveSuggestion(
 		)
 	}
 
-	channelText := buildChannelMessage(cfg, s)
+	media, err := getSuggestionMedia(
+		db,
+		id,
+	)
 
-	if err := api.SendMessage(
-		ctx,
-		cfg.ChannelID,
-		channelText,
-		nil,
-	); err != nil {
-		return api.AnswerCallbackQuery(
-			ctx,
-			cb.ID,
-			cfg.Texts.Errors.Generic,
+	if err != nil {
+		return err
+	}
+
+	if len(media) == 0 {
+		channelText := buildChannelMessage(
+			cfg,
+			s,
 		)
+
+		if err := api.SendMessage(
+			ctx,
+			cfg.ChannelID,
+			channelText,
+			nil,
+		); err != nil {
+			return api.AnswerCallbackQuery(
+				ctx,
+				cb.ID,
+				cfg.Texts.Errors.Generic,
+			)
+		}
+	} else {
+		header := buildChannelHeader(
+			cfg,
+			s,
+		)
+
+		if err := api.SendMessage(
+			ctx,
+			cfg.ChannelID,
+			header,
+			nil,
+		); err != nil {
+			return api.AnswerCallbackQuery(
+				ctx,
+				cb.ID,
+				cfg.Texts.Errors.Generic,
+			)
+		}
+
+		messageIDs := make([]int, 0, len(media))
+
+		for _, item := range media {
+			messageIDs = append(
+				messageIDs,
+				item.SourceMessageID,
+			)
+		}
+
+		if _, err := api.CopyMessages(
+			ctx,
+			cfg.ChannelID,
+			media[0].SourceChatID,
+			messageIDs,
+		); err != nil {
+			return api.AnswerCallbackQuery(
+				ctx,
+				cb.ID,
+				cfg.Texts.Errors.Generic,
+			)
+		}
 	}
 
 	_, err = db.Exec(`
@@ -879,7 +1764,11 @@ func rejectSuggestion(
 	cb *tgCallbackQuery,
 	rawID string,
 ) error {
-	id, err := strconv.ParseInt(rawID, 10, 64)
+	id, err := strconv.ParseInt(
+		rawID,
+		10,
+		64,
+	)
 
 	if err != nil {
 		return api.AnswerCallbackQuery(
@@ -889,7 +1778,10 @@ func rejectSuggestion(
 		)
 	}
 
-	s, err := getSuggestion(db, id)
+	s, err := getSuggestion(
+		db,
+		id,
+	)
 
 	if err != nil {
 		return api.AnswerCallbackQuery(
@@ -947,7 +1839,138 @@ func rejectSuggestion(
 	)
 }
 
-func buildChannelMessage(
+type suggestionMedia struct {
+	SourceChatID    int64
+	SourceMessageID int
+	SortOrder       int
+}
+
+func getSuggestionMedia(
+	db *sql.DB,
+	suggestionID int64,
+) ([]suggestionMedia, error) {
+	rows, err := db.Query(`
+		SELECT
+			source_chat_id,
+			source_message_id,
+			sort_order
+		FROM suggestion_media
+		WHERE suggestion_id=?
+		ORDER BY sort_order ASC
+	`,
+		suggestionID,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	var media []suggestionMedia
+
+	for rows.Next() {
+		var item suggestionMedia
+
+		if err := rows.Scan(
+			&item.SourceChatID,
+			&item.SourceMessageID,
+			&item.SortOrder,
+		); err != nil {
+			return nil, err
+		}
+
+		media = append(
+			media,
+			item,
+		)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return media, nil
+}
+
+func getSuggestion(
+	db *sql.DB,
+	id int64,
+) (Suggestion, error) {
+	var (
+		s       Suggestion
+		anonInt int
+	)
+
+	err := db.QueryRow(`
+		SELECT
+			id,
+			user_id,
+			username,
+			display_name,
+			text,
+			anonymous,
+			anonymous_id,
+			status,
+			created_at,
+			reviewed_by,
+			review_message
+		FROM suggestions
+		WHERE id=?
+	`,
+		id,
+	).Scan(
+		&s.ID,
+		&s.UserID,
+		&s.Username,
+		&s.DisplayName,
+		&s.Text,
+		&anonInt,
+		&s.AnonymousID,
+		&s.Status,
+		&s.CreatedAt,
+		&s.ReviewedBy,
+		&s.ReviewMessage,
+	)
+
+	s.Anonymous = anonInt != 0
+
+	return s, err
+}
+
+func getSuggestionIdentifier(
+	db *sql.DB,
+	id int64,
+) (string, error) {
+	s, err := getSuggestion(
+		db,
+		id,
+	)
+
+	if err != nil {
+		return "", err
+	}
+
+	if s.Anonymous {
+		if s.AnonymousID != "" {
+			return s.AnonymousID, nil
+		}
+
+		return "Anonymous", nil
+	}
+
+	if s.Username != "" {
+		return "@" + s.Username, nil
+	}
+
+	if s.DisplayName != "" {
+		return s.DisplayName, nil
+	}
+
+	return "user", nil
+}
+
+func buildChannelHeader(
 	cfg Config,
 	s Suggestion,
 ) string {
@@ -959,32 +1982,66 @@ func buildChannelMessage(
 	}
 
 	if cfg.Texts.Channel.ShowID {
-		b.WriteString(fmt.Sprintf("#%d\n\n", s.ID))
+		b.WriteString(
+			fmt.Sprintf("#%d", s.ID),
+		)
+		b.WriteString("\n\n")
 	}
 
-	b.WriteString(s.Text)
-
 	if cfg.Texts.Channel.ShowAuthor {
-		author := formatSuggestionAuthor(
-			cfg,
-			s,
-			cfg.Texts.Channel.AnonymousAuthor,
-			"",
+		b.WriteString(
+			cfg.Texts.Channel.AuthorPrefix,
 		)
+		b.WriteString(" ")
 
-		if author != "" {
-			b.WriteString("\n\n")
-			b.WriteString(cfg.Texts.Channel.AuthorPrefix)
+		if s.Anonymous {
+			b.WriteString(
+				cfg.Texts.Channel.AnonymousAuthor,
+			)
+		} else if s.Username != "" {
+			b.WriteString("@")
+			b.WriteString(s.Username)
+		} else if s.DisplayName != "" {
+			b.WriteString(s.DisplayName)
+		}
+
+		if s.Anonymous &&
+			cfg.Texts.Channel.ShowAnonymousID &&
+			s.AnonymousID != "" {
+
+			b.WriteString("\n")
+			b.WriteString(
+				cfg.Texts.Channel.AnonymousIDPrefix,
+			)
 			b.WriteString(" ")
-			b.WriteString(author)
+			b.WriteString(s.AnonymousID)
 		}
 	}
 
-	return b.String()
+	return strings.TrimSpace(b.String())
+}
+
+func buildChannelMessage(
+	cfg Config,
+	s Suggestion,
+) string {
+	header := buildChannelHeader(
+		cfg,
+		s,
+	)
+
+	if header == "" {
+		return s.Text
+	}
+
+	if s.Text == "" {
+		return header
+	}
+
+	return header + "\n\n" + s.Text
 }
 
 func formatSuggestionAuthor(
-	cfg Config,
 	s Suggestion,
 	anonymousLabel string,
 	namedFallback string,
@@ -1005,50 +2062,7 @@ func formatSuggestionAuthor(
 		return namedFallback
 	}
 
-	return "Пользователь"
-}
-
-func getSuggestion(
-	db *sql.DB,
-	id int64,
-) (Suggestion, error) {
-	var (
-		s       Suggestion
-		anonInt int
-	)
-
-	err := db.QueryRow(`
-		SELECT
-			id,
-			user_id,
-			username,
-			display_name,
-			text,
-			anonymous,
-			status,
-			created_at,
-			reviewed_by,
-			review_message
-		FROM suggestions
-		WHERE id=?
-	`,
-		id,
-	).Scan(
-		&s.ID,
-		&s.UserID,
-		&s.Username,
-		&s.DisplayName,
-		&s.Text,
-		&anonInt,
-		&s.Status,
-		&s.CreatedAt,
-		&s.ReviewedBy,
-		&s.ReviewMessage,
-	)
-
-	s.Anonymous = anonInt != 0
-
-	return s, err
+	return "user"
 }
 
 func sendQueue(
@@ -1061,7 +2075,6 @@ func sendQueue(
 		SELECT
 			id,
 			text,
-			anonymous,
 			created_at
 		FROM suggestions
 		WHERE status='pending'
@@ -1077,7 +2090,9 @@ func sendQueue(
 
 	var b strings.Builder
 
-	b.WriteString(cfg.Texts.Admin.QueueTitle)
+	b.WriteString(
+		cfg.Texts.Admin.QueueTitle,
+	)
 	b.WriteString("\n\n")
 
 	count := 0
@@ -1086,14 +2101,12 @@ func sendQueue(
 		var (
 			id        int64
 			text      string
-			anonymous int
 			createdAt time.Time
 		)
 
 		if err := rows.Scan(
 			&id,
 			&text,
-			&anonymous,
 			&createdAt,
 		); err != nil {
 			return err
@@ -1101,11 +2114,17 @@ func sendQueue(
 
 		count++
 
+		if text == "" {
+			text = cfg.Texts.Moderation.MediaLabel
+		}
+
 		b.WriteString(
 			fmt.Sprintf(
 				cfg.Texts.Admin.QueueItem,
 				id,
-				createdAt.Format("2006-01-02 15:04"),
+				createdAt.Format(
+					"2006-01-02 15:04",
+				),
 				truncate(text, 120),
 			),
 		)
@@ -1118,7 +2137,9 @@ func sendQueue(
 	}
 
 	if count == 0 {
-		b.WriteString(cfg.Texts.Admin.QueueEmpty)
+		b.WriteString(
+			cfg.Texts.Admin.QueueEmpty,
+		)
 	}
 
 	return api.SendMessage(
@@ -1127,6 +2148,226 @@ func sendQueue(
 		b.String(),
 		nil,
 	)
+}
+
+func ensureAnonymousID(
+	db *sql.DB,
+	userID int64,
+) (string, error) {
+	var anonymousID string
+
+	err := db.QueryRow(`
+		SELECT anonymous_id
+		FROM anonymous_users
+		WHERE user_id=?
+	`,
+		userID,
+	).Scan(&anonymousID)
+
+	if err == nil {
+		return anonymousID, nil
+	}
+
+	if err != sql.ErrNoRows {
+		return "", err
+	}
+
+	for i := 0; i < 20; i++ {
+		candidate, err := generateAnonymousID()
+		if err != nil {
+			return "", err
+		}
+
+		_, err = db.Exec(`
+			INSERT INTO anonymous_users
+			(user_id, anonymous_id)
+			VALUES (?, ?)
+		`,
+			userID,
+			candidate,
+		)
+
+		if err == nil {
+			return candidate, nil
+		}
+
+		if strings.Contains(
+			err.Error(),
+			"UNIQUE constraint failed",
+		) {
+			var existing string
+
+			queryErr := db.QueryRow(`
+				SELECT anonymous_id
+				FROM anonymous_users
+				WHERE user_id=?
+			`,
+				userID,
+			).Scan(&existing)
+
+			if queryErr == nil {
+				return existing, nil
+			}
+		}
+	}
+
+	return "", errors.New(
+		"failed to generate unique anonymous ID",
+	)
+}
+
+func generateAnonymousID() (string, error) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+	buf := make([]byte, 6)
+
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+
+	b.WriteString("ANON-")
+
+	for _, value := range buf {
+		b.WriteByte(
+			alphabet[int(value)%len(alphabet)],
+		)
+	}
+
+	return b.String(), nil
+}
+
+func hasSupportedMedia(msg *tgMessage) bool {
+	return len(msg.Photo) > 0 ||
+		msg.Video != nil ||
+		msg.Document != nil ||
+		msg.Audio != nil ||
+		msg.Voice != nil ||
+		msg.VideoNote != nil
+}
+
+func hasUnsupportedMedia(msg *tgMessage) bool {
+	return msg.Animation != nil ||
+		msg.Sticker != nil
+}
+
+func hasMessageContent(msg *tgMessage) bool {
+	return strings.TrimSpace(msg.Text) != "" ||
+		strings.TrimSpace(msg.Caption) != "" ||
+		hasSupportedMedia(msg) ||
+		hasUnsupportedMedia(msg)
+}
+
+func userLabel(u tgUser) string {
+	if u.Username != "" {
+		return "@" + u.Username
+	}
+
+	name := strings.TrimSpace(
+		strings.Join(
+			[]string{
+				u.FirstName,
+				u.LastName,
+			},
+			" ",
+		),
+	)
+
+	if name != "" {
+		return name
+	}
+
+	return "user"
+}
+
+func truncate(
+	s string,
+	n int,
+) string {
+	r := []rune(s)
+
+	if len(r) <= n {
+		return s
+	}
+
+	return string(r[:n]) + "…"
+}
+
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+
+	return 0
+}
+
+func (c *AlbumCollector) Add(
+	key string,
+	msg *tgMessage,
+	flush func([]*tgMessage),
+) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if album, ok := c.albums[key]; ok {
+		album.Messages = append(
+			album.Messages,
+			msg,
+		)
+
+		if album.Timer != nil {
+			album.Timer.Stop()
+		}
+
+		album.Timer = time.AfterFunc(
+			albumCollectDelay,
+			func() {
+				c.flush(key, flush)
+			},
+		)
+
+		return nil
+	}
+
+	album := &pendingAlbum{
+		Messages: []*tgMessage{msg},
+	}
+
+	album.Timer = time.AfterFunc(
+		albumCollectDelay,
+		func() {
+			c.flush(key, flush)
+		},
+	)
+
+	c.albums[key] = album
+
+	return nil
+}
+
+func (c *AlbumCollector) flush(
+	key string,
+	flush func([]*tgMessage),
+) {
+	c.mu.Lock()
+
+	album, ok := c.albums[key]
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+
+	delete(c.albums, key)
+
+	messages := append(
+		[]*tgMessage(nil),
+		album.Messages...,
+	)
+
+	c.mu.Unlock()
+
+	flush(messages)
 }
 
 func (api *BotAPI) call(
@@ -1143,7 +2384,10 @@ func (api *BotAPI) call(
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		"https://api.telegram.org/bot"+api.Token+"/"+method,
+		"https://api.telegram.org/bot"+
+			api.Token+
+			"/"+
+			method,
 		bytes.NewReader(body),
 	)
 
@@ -1151,7 +2395,10 @@ func (api *BotAPI) call(
 		return err
 	}
 
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(
+		"Content-Type",
+		"application/json",
+	)
 
 	resp, err := api.Client.Do(req)
 	if err != nil {
@@ -1167,7 +2414,10 @@ func (api *BotAPI) call(
 
 	var envelope tgResponse[json.RawMessage]
 
-	if err := json.Unmarshal(data, &envelope); err != nil {
+	if err := json.Unmarshal(
+		data,
+		&envelope,
+	); err != nil {
 		return fmt.Errorf(
 			"telegram returned invalid JSON: %w",
 			err,
@@ -1181,7 +2431,9 @@ func (api *BotAPI) call(
 		)
 	}
 
-	if result != nil && len(envelope.Result) > 0 {
+	if result != nil &&
+		len(envelope.Result) > 0 {
+
 		if err := json.Unmarshal(
 			envelope.Result,
 			result,
@@ -1220,8 +2472,8 @@ func (api *BotAPI) GetUpdates(
 		ctx,
 		"getUpdates",
 		map[string]any{
-			"offset": offset,
-			"limit":  limit,
+			"offset":  offset,
+			"limit":   limit,
 			"timeout": timeout,
 			"allowed_updates": []string{
 				"message",
@@ -1277,6 +2529,50 @@ func (api *BotAPI) SendMessageWithResult(
 	return message, err
 }
 
+func (api *BotAPI) CopyMessage(
+	ctx context.Context,
+	chatID int64,
+	fromChatID int64,
+	messageID int,
+) (tgMessage, error) {
+	var message tgMessage
+
+	err := api.call(
+		ctx,
+		"copyMessage",
+		map[string]any{
+			"chat_id":      chatID,
+			"from_chat_id": fromChatID,
+			"message_id":   messageID,
+		},
+		&message,
+	)
+
+	return message, err
+}
+
+func (api *BotAPI) CopyMessages(
+	ctx context.Context,
+	chatID int64,
+	fromChatID int64,
+	messageIDs []int,
+) ([]tgMessage, error) {
+	var messages []tgMessage
+
+	err := api.call(
+		ctx,
+		"copyMessages",
+		map[string]any{
+			"chat_id":      chatID,
+			"from_chat_id": fromChatID,
+			"message_ids":  messageIDs,
+		},
+		&messages,
+	)
+
+	return messages, err
+}
+
 func (api *BotAPI) AnswerCallbackQuery(
 	ctx context.Context,
 	callbackID,
@@ -1291,47 +2587,4 @@ func (api *BotAPI) AnswerCallbackQuery(
 		},
 		nil,
 	)
-}
-
-func userLabel(u tgUser) string {
-	if u.Username != "" {
-		return "@" + u.Username
-	}
-
-	name := strings.TrimSpace(
-		strings.Join(
-			[]string{
-				u.FirstName,
-				u.LastName,
-			},
-			" ",
-		),
-	)
-
-	if name != "" {
-		return name
-	}
-
-	return "пользователь"
-}
-
-func truncate(
-	s string,
-	n int,
-) string {
-	r := []rune(s)
-
-	if len(r) <= n {
-		return s
-	}
-
-	return string(r[:n]) + "…"
-}
-
-func boolInt(v bool) int {
-	if v {
-		return 1
-	}
-
-	return 0
 }

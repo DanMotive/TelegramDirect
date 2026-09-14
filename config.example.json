@@ -19,7 +19,9 @@
     "sent_text": "✅ Your suggestion has been sent for moderation.",
     "no_mode_text": "First choose a submission mode using /suggest.",
     "cancel_text": "❌ Submission cancelled.",
+    "unsupported_media_text": "❌ This type of media is not supported. GIFs and stickers are not allowed.",
     "anonymous_author": "Anonymous",
+    "reply_text": "💬 Reply to your suggestion #%d:\n\n%s",
     "max_length": 4000
   },
 
@@ -28,7 +30,9 @@
     "id_label": "ID",
     "author_label": "Author",
     "text_label": "Text",
+    "media_label": "Attachments",
     "anonymous_author": "Anonymous",
+    "anonymous_id_label": "Anonymous ID",
     "named_fallback": "User without username",
     "approve_button": "✅ Publish",
     "reject_button": "❌ Reject",
@@ -39,15 +43,21 @@
     "invalid_id": "Invalid suggestion ID.",
     "no_permission": "You do not have permission to do this.",
     "published_callback": "Published",
-    "rejected_callback": "Rejected"
+    "rejected_callback": "Rejected",
+    "reply_sent_log": "💬 Reply to suggestion #%d was sent to %s by %s.",
+    "reply_not_found": "This message is not linked to a suggestion.",
+    "reply_empty": "The reply cannot be empty.",
+    "reply_failed": "Failed to send the reply."
   },
 
   "channel": {
     "header": "📢 Suggestion",
     "show_id": false,
     "show_author": true,
+    "show_anonymous_id": false,
     "author_prefix": "👤 Author:",
-    "anonymous_author": "Anonymous"
+    "anonymous_author": "Anonymous",
+    "anonymous_id_prefix": "🆔"
   },
 
   "admin": {
