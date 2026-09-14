@@ -27,7 +27,11 @@ if [[ "${EUID}" -ne 0 ]]; then
     echo "Run this script as root or with sudo."
     exit 1
 fi
-
+if [[ -f ./telegramdirect ]]; then
+    install -m 755 ./telegramdirect /usr/local/bin/telegramdirect
+else
+    echo "Warning: telegramdirect CLI script not found."
+fi
 echo "========================================"
 echo " TelegramDirect Bot Installer"
 echo "========================================"
@@ -90,7 +94,7 @@ done
 
 echo
 echo "Checking latest TelegramDirect release..."
-
+install -m 755 telegramdirect /usr/local/bin/telegramdirect
 apt-get update
 apt-get install -y ca-certificates curl sqlite3
 

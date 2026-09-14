@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="suggestion-bot"
+APP_DIR="/opt/$APP_NAME"
+DATA_DIR="/var/lib/$APP_NAME"
+BINARY="$APP_DIR/$APP_NAME"
+ENV_FILE="$APP_DIR/.env"
+CONFIG_FILE="$APP_DIR/config.json"
+SERVICE_FILE="/etc/systemd/system/$APP_NAME.service"
+PM2_CONFIG="$APP_DIR/ecosystem.config.js"
+REPO="DanMotive/TelegramDirect"
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+require_root() {
+    [[ "${EUID}" -eq 0 ]] || die "Run this command with sudo."
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64)
+            ARCH="amd64"
+            ;;
+        aarch64|arm64)
+            ARCH="arm64"
+            ;;
+        *)
+            die "Unsupported architecture: $(uname -m)"
+            ;;
+    esac
+}
+
+get_latest_release() {
+    curl -fsSL \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/$REPO/releases/latest" |
+        sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' |
+        head -n 1
+}
+
+detect_manager() {
+    if [[ -f "$SERVICE_FILE" ]]; then
+        MANAGER="systemd"
+        return
+    fi
+
+    if [[ -f "$PM2_CONFIG" ]]; then
+        MANAGER="pm2"
+        return
+    fi
+
+    MANAGER="unknown"
+}
+
+start_bot() {
+    detect_manager
+
+    case "$MANAGER" in
+        systemd)
+            systemctl restart "$APP_NAME"
+            ;;
+
+        pm2)
+            PM2_HOME="$DATA_DIR/.pm2"
+
+            runuser -u "$APP_NAME" -- \
+                env PM2_HOME="$PM2_HOME" \
+                pm2 restart "$APP_NAME"
+            ;;
+
+        *)
+            die "Could not detect process manager."
+            ;;
+    esac
+}
+
+config_command() {
+    require_root
+
+    mkdir -p "$APP_DIR"
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        if [[ -f "$(dirname "$0")/config.example.json" ]]; then
+            cp "$(dirname "$0")/config.example.json" "$CONFIG_FILE"
+        else
+            cat > "$CONFIG_FILE" <<'JSON'
+{
+  "bot": {
+    "name": "TelegramDirect",
+    "welcome_text": "Привет! Здесь можно отправить предложение.",
+    "help_text": "Выбери способ отправки предложения.",
+    "anonymous_button": "🕵️ Анонимно",
+    "named_button": "👤 От своего имени",
+    "cancel_button": "❌ Отмена"
+  },
+  "suggestion": {
+    "ask_text": "Напиши своё предложение:",
+    "anonymous_author": "Анонимно",
+    "max_length": 4000,
+    "too_long_text": "Предложение слишком длинное.",
+    "empty_text": "Предложение не может быть пустым.",
+    "sent_text": "✅ Предложение отправлено на модерацию!"
+  },
+  "moderation": {
+    "title": "📨 Новое предложение",
+    "id_label": "Номер",
+    "author_label": "Автор",
+    "approve_button": "✅ Опубликовать",
+    "reject_button": "❌ Отклонить",
+    "approved_log": "✅ Предложение опубликовано.",
+    "rejected_log": "❌ Предложение отклонено.",
+    "already_processed": "Это предложение уже обработано."
+  },
+  "channel": {
+    "header": "📢 Предложение",
+    "show_author": true,
+    "author_prefix": "👤 Автор:",
+    "anonymous_author": "Аноним"
+  },
+  "errors": {
+    "generic": "Произошла ошибка.",
+    "not_allowed": "У вас нет доступа к этому действию."
+  }
+}
+JSON
+        fi
+    fi
+
+    EDITOR="${EDITOR:-nano}"
+
+    if ! command -v "$EDITOR" >/dev/null 2>&1; then
+        echo "Editor '$EDITOR' is not installed."
+        echo "Install nano with:"
+        echo "  sudo apt-get install nano"
+        exit 1
+    fi
+
+    "$EDITOR" "$CONFIG_FILE"
+
+    echo
+    echo "Configuration saved to:"
+    echo "  $CONFIG_FILE"
+    echo
+    echo "Restarting bot..."
+
+    start_bot
+
+    echo "Bot restarted."
+}
+
+update_command() {
+    require_root
+    detect_arch
+
+    echo "TelegramDirect update"
+    echo "Architecture: linux-$ARCH"
+    echo
+
+    command -v curl >/dev/null 2>&1 ||
+        die "curl is required."
+
+    LATEST_TAG="$(get_latest_release)"
+
+    [[ -n "$LATEST_TAG" ]] ||
+        die "Could not determine latest GitHub release."
+
+    echo "Latest release: $LATEST_TAG"
+
+    RELEASE_URL="https://api.github.com/repos/$REPO/releases/tags/$LATEST_TAG"
+
+    ASSET="suggestion-bot-linux-$ARCH"
+    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$ASSET"
+
+    TMP_BINARY="$(mktemp)"
+    TMP_CHECKSUMS="$(mktemp)"
+
+    trap 'rm -f "$TMP_BINARY" "$TMP_CHECKSUMS"' EXIT
+
+    echo "Downloading binary..."
+
+    curl -fL "$DOWNLOAD_URL" -o "$TMP_BINARY"
+
+    echo "Downloading checksums..."
+
+    curl -fL \
+        "https://github.com/$REPO/releases/download/$LATEST_TAG/checksums.txt" \
+        -o "$TMP_CHECKSUMS"
+
+    EXPECTED="$(
+        awk -v file="$ASSET" '$2 == file {print $1}' "$TMP_CHECKSUMS"
+    )"
+
+    [[ -n "$EXPECTED" ]] ||
+        die "Checksum for $ASSET was not found."
+
+    ACTUAL="$(sha256sum "$TMP_BINARY" | awk '{print $1}')"
+
+    if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+        die "SHA-256 checksum verification failed."
+    fi
+
+    echo "Checksum OK."
+
+    mkdir -p "$APP_DIR"
+
+    chmod 755 "$TMP_BINARY"
+
+    echo "Installing new binary..."
+
+    install -m 755 "$TMP_BINARY" "$BINARY"
+    chown root:root "$BINARY"
+
+    echo "Restarting bot..."
+
+    start_bot
+
+    echo
+    echo "Update complete."
+    echo "Version:      $LATEST_TAG"
+    echo "Architecture: linux-$ARCH"
+}
+
+uninstall_command() {
+    require_root
+
+    echo "========================================"
+    echo " TelegramDirect Uninstaller"
+    echo "========================================"
+    echo
+
+    read -rp "Continue? [y/N]: " CONFIRM
+
+    [[ "$CONFIRM" =~ ^[Yy]$ ]] || {
+        echo "Cancelled."
+        exit 0
+    }
+
+    echo
+    echo "Stopping TelegramDirect..."
+
+    # systemd
+    if [[ -f "$SERVICE_FILE" ]]; then
+        systemctl disable --now "$APP_NAME" 2>/dev/null || true
+        rm -f "$SERVICE_FILE"
+        systemctl daemon-reload
+    fi
+
+    # PM2
+    PM2_HOME="$DATA_DIR/.pm2"
+
+    if command -v pm2 >/dev/null 2>&1 && \
+       id -u "$APP_NAME" >/dev/null 2>&1 && \
+       [[ -d "$PM2_HOME" ]]; then
+
+        runuser -u "$APP_NAME" -- \
+            env PM2_HOME="$PM2_HOME" \
+            pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+
+        runuser -u "$APP_NAME" -- \
+            env PM2_HOME="$PM2_HOME" \
+            pm2 save >/dev/null 2>&1 || true
+    fi
+
+    echo
+    echo "Application files:"
+    echo "  $APP_DIR"
+
+    rm -rf "$APP_DIR"
+
+    echo
+    echo "Persistent data:"
+    echo "  $DATA_DIR"
+
+    read -rp "Delete database and all persistent data? [y/N]: " REMOVE_DATA
+
+    if [[ "$REMOVE_DATA" =~ ^[Yy]$ ]]; then
+        rm -rf "$DATA_DIR"
+
+        if id -u "$APP_NAME" >/dev/null 2>&1; then
+            userdel "$APP_NAME" 2>/dev/null || true
+        fi
+
+        echo "Database and persistent data removed."
+    else
+        echo "Persistent data preserved."
+    fi
+
+    # Remove command itself
+    rm -f /usr/local/bin/telegramdirect
+
+    echo
+    echo "TelegramDirect has been uninstalled."
+}
+
+show_help() {
+    cat <<EOF
+TelegramDirect
+
+Usage:
+  telegramdirect config
+  telegramdirect update
+  telegramdirect uninstall
+
+Commands:
+
+  config
+      Edit config.json and restart the bot.
+
+  update
+      Download the latest GitHub Release, verify its SHA-256
+      checksum and restart the bot.
+
+  uninstall
+      Stop the bot and remove the installation.
+      Persistent data is deleted only after confirmation.
+
+EOF
+}
+
+case "${1:-}" in
+    config)
+        config_command
+        ;;
+
+    update)
+        update_command
+        ;;
+
+    uninstall)
+        uninstall_command
+        ;;
+
+    help|-h|--help|"")
+        show_help
+        ;;
+
+    *)
+        echo "Unknown command: $1"
+        echo
+        show_help
+        exit 1
+        ;;
+esac
