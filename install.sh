@@ -16,8 +16,9 @@ CONFIG_FILE="$APP_DIR/config.json"
 SERVICE_FILE="/etc/systemd/system/$APP_NAME.service"
 PM2_CONFIG="$APP_DIR/ecosystem.config.js"
 
-CLI_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/telegramdirect"
-CONFIG_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.example.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLI_SOURCE="$SCRIPT_DIR/telegramdirect"
+CONFIG_SOURCE="$SCRIPT_DIR/config.example.json"
 
 if [[ "${EUID}" -ne 0 ]]; then
     echo "Run this script as root or with sudo."
@@ -45,15 +46,15 @@ esac
 echo "Detected architecture: linux-$ARCH"
 echo
 
-if [[ ! -f "$CONFIG_SOURCE" ]]; then
-    echo "config.example.json was not found."
-    echo "Run the installer from the TelegramDirect project directory."
+if [[ ! -f "$CLI_SOURCE" ]]; then
+    echo "telegramdirect was not found:"
+    echo "  $CLI_SOURCE"
     exit 1
 fi
 
-if [[ ! -f "$CLI_SOURCE" ]]; then
-    echo "telegramdirect CLI script was not found."
-    echo "Run the installer from the TelegramDirect project directory."
+if [[ ! -f "$CONFIG_SOURCE" ]]; then
+    echo "config.example.json was not found:"
+    echo "  $CONFIG_SOURCE"
     exit 1
 fi
 
@@ -70,7 +71,7 @@ read -rp "Admin Telegram IDs (comma-separated): " ADMIN_IDS
 echo
 echo "Process manager:"
 echo "  1) systemd (recommended)"
-echo "  2) PM2"
+echo "  2) PM2 (uses the existing system-wide PM2)"
 
 read -rp "Choose [1-2]: " PROCESS_MANAGER
 
@@ -119,7 +120,7 @@ done
 echo
 echo "Repository:     $REPO"
 echo "Architecture:   linux-$ARCH"
-echo "Manager:        $PROCESS_MANAGER"
+echo "Process manager: $PROCESS_MANAGER"
 echo
 
 read -rp "Continue installation? [y/N]: " CONFIRM
@@ -139,13 +140,16 @@ apt-get install -y ca-certificates curl
 
 if [[ "$PROCESS_MANAGER" == "pm2" ]]; then
     if ! command -v pm2 >/dev/null 2>&1; then
-        echo "PM2 is not installed."
+        echo
+        echo "PM2 is not installed. Installing Node.js and PM2..."
 
         if ! command -v npm >/dev/null 2>&1; then
             apt-get install -y nodejs npm
         fi
 
         npm install -g pm2
+    else
+        echo "Existing PM2 installation found."
     fi
 fi
 
@@ -211,17 +215,6 @@ fi
 
 echo "SHA-256 verification successful."
 
-if ! id -u "$APP_NAME" >/dev/null 2>&1; then
-    echo
-    echo "Creating system user: $APP_NAME"
-
-    useradd \
-        --system \
-        --home "$APP_DIR" \
-        --shell /usr/sbin/nologin \
-        "$APP_NAME"
-fi
-
 mkdir -p "$APP_DIR"
 mkdir -p "$DATA_DIR"
 
@@ -231,7 +224,7 @@ echo "Installing binary..."
 install -m 755 "$TMP_BINARY" "$BINARY"
 chown root:root "$BINARY"
 
-echo "Installing CLI..."
+echo "Installing management command..."
 
 install -m 755 "$CLI_SOURCE" /usr/local/bin/telegramdirect
 
@@ -267,7 +260,6 @@ DB_PATH=$DATA_DIR/data.db
 CONFIG_PATH=$CONFIG_FILE
 ENV
 
-chown root:"$APP_NAME" "$ENV_FILE"
 chmod 640 "$ENV_FILE"
 
 echo
@@ -275,13 +267,14 @@ echo "Creating config.json..."
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
     cp "$CONFIG_SOURCE" "$CONFIG_FILE"
-    chown root:"$APP_NAME" "$CONFIG_FILE"
-    chmod 640 "$CONFIG_FILE"
+    chmod 644 "$CONFIG_FILE"
 else
     echo "Existing config.json preserved."
 fi
 
-chown "$APP_NAME":"$APP_NAME" "$DATA_DIR"
+echo
+echo "Preparing data directory..."
+
 chmod 750 "$DATA_DIR"
 
 if [[ "$PROCESS_MANAGER" == "systemd" ]]; then
@@ -289,16 +282,11 @@ if [[ "$PROCESS_MANAGER" == "systemd" ]]; then
     echo
     echo "Configuring systemd..."
 
-    # Remove old PM2 process if switching from PM2.
-    if command -v pm2 >/dev/null 2>&1 &&
-       id -u "$APP_NAME" >/dev/null 2>&1 &&
-       [[ -d "$DATA_DIR/.pm2" ]]; then
-
-        PM2_HOME="$DATA_DIR/.pm2"
-
-        runuser -u "$APP_NAME" -- \
-            env PM2_HOME="$PM2_HOME" \
-            pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+    # If TelegramDirect was previously running under PM2,
+    # remove only its PM2 process.
+    if command -v pm2 >/dev/null 2>&1; then
+        pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+        pm2 save >/dev/null 2>&1 || true
     fi
 
     cat > "$SERVICE_FILE" <<SERVICE
@@ -309,8 +297,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$APP_NAME
-Group=$APP_NAME
+User=root
+Group=root
 WorkingDirectory=$APP_DIR
 EnvironmentFile=$ENV_FILE
 ExecStart=$BINARY
@@ -334,19 +322,15 @@ SERVICE
 else
 
     echo
-    echo "Configuring PM2..."
+    echo "Configuring shared PM2..."
 
-    # Remove old systemd service if switching from systemd.
+    # If TelegramDirect was previously managed by systemd,
+    # remove only its systemd service.
     if [[ -f "$SERVICE_FILE" ]]; then
         systemctl disable --now "$APP_NAME" 2>/dev/null || true
         rm -f "$SERVICE_FILE"
         systemctl daemon-reload
     fi
-
-    PM2_HOME="$DATA_DIR/.pm2"
-
-    mkdir -p "$PM2_HOME"
-    chown -R "$APP_NAME":"$APP_NAME" "$PM2_HOME"
 
     cat > "$PM2_CONFIG" <<PM2
 module.exports = {
@@ -366,27 +350,13 @@ PM2
     chown root:root "$PM2_CONFIG"
     chmod 644 "$PM2_CONFIG"
 
-    runuser -u "$APP_NAME" -- \
-        env PM2_HOME="$PM2_HOME" \
-        pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+    # Replace only TelegramDirect if it already exists.
+    pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
 
-    runuser -u "$APP_NAME" -- \
-        env PM2_HOME="$PM2_HOME" \
-        pm2 start "$PM2_CONFIG"
+    pm2 start "$PM2_CONFIG"
 
-    runuser -u "$APP_NAME" -- \
-        env PM2_HOME="$PM2_HOME" \
-        pm2 save
-
-    echo
-    echo "Generating PM2 startup configuration..."
-
-    runuser -u "$APP_NAME" -- \
-        env PM2_HOME="$PM2_HOME" \
-        pm2 startup systemd \
-            -u "$APP_NAME" \
-            --hp "$APP_DIR" \
-        >/tmp/${APP_NAME}-pm2-startup.txt 2>&1 || true
+    # Save the existing PM2 application list, including TelegramDirect.
+    pm2 save
 
     MANAGER_INFO="PM2"
 fi
@@ -399,12 +369,9 @@ echo "Checking bot status..."
 if [[ "$PROCESS_MANAGER" == "systemd" ]]; then
     RUNNING="$(systemctl is-active "$APP_NAME" 2>/dev/null || true)"
 else
-    PM2_HOME="$DATA_DIR/.pm2"
-
     RUNNING="$(
-        runuser -u "$APP_NAME" -- \
-            env PM2_HOME="$PM2_HOME" \
-            pm2 jlist 2>/dev/null |
+        pm2 jlist 2>/dev/null |
+        grep -q "\"name\":\"$APP_NAME\"" &&
         grep -q '"status":"online"' &&
         echo online ||
         true
@@ -440,17 +407,10 @@ if [[ "$RUNNING" == "active" || "$RUNNING" == "online" ]]; then
         echo "  journalctl -u $APP_NAME -f"
     else
         echo "Status:"
-        echo "  runuser -u $APP_NAME -- env PM2_HOME=$PM2_HOME pm2 status"
+        echo "  pm2 status"
         echo
         echo "Logs:"
-        echo "  runuser -u $APP_NAME -- env PM2_HOME=$PM2_HOME pm2 logs $APP_NAME"
-
-        if [[ -s "/tmp/${APP_NAME}-pm2-startup.txt" ]]; then
-            echo
-            echo "PM2 startup instructions:"
-            echo
-            cat "/tmp/${APP_NAME}-pm2-startup.txt" || true
-        fi
+        echo "  pm2 logs $APP_NAME"
     fi
 
     echo
@@ -469,7 +429,7 @@ else
         echo "  journalctl -u $APP_NAME -n 50 --no-pager"
     else
         echo "Logs:"
-        echo "  runuser -u $APP_NAME -- env PM2_HOME=$PM2_HOME pm2 logs $APP_NAME --lines 50"
+        echo "  pm2 logs $APP_NAME --lines 50"
     fi
 
     exit 1

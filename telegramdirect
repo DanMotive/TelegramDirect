@@ -28,6 +28,20 @@ require_root() {
     fi
 }
 
+detect_manager() {
+    if [[ -f "$SERVICE_FILE" ]]; then
+        MANAGER="systemd"
+        return
+    fi
+
+    if [[ -f "$PM2_CONFIG" ]]; then
+        MANAGER="pm2"
+        return
+    fi
+
+    MANAGER="unknown"
+}
+
 detect_arch() {
     case "$(uname -m)" in
         x86_64)
@@ -50,20 +64,6 @@ get_latest_release() {
         head -n 1
 }
 
-detect_manager() {
-    if [[ -f "$SERVICE_FILE" ]]; then
-        MANAGER="systemd"
-        return
-    fi
-
-    if [[ -f "$PM2_CONFIG" ]]; then
-        MANAGER="pm2"
-        return
-    fi
-
-    MANAGER="unknown"
-}
-
 restart_bot() {
     detect_manager
 
@@ -73,11 +73,10 @@ restart_bot() {
             ;;
 
         pm2)
-            PM2_HOME="$DATA_DIR/.pm2"
+            command -v pm2 >/dev/null 2>&1 ||
+                die "PM2 is not installed."
 
-            runuser -u "$APP_NAME" -- \
-                env PM2_HOME="$PM2_HOME" \
-                pm2 restart "$APP_NAME"
+            pm2 restart "$APP_NAME"
             ;;
 
         *)
@@ -130,6 +129,8 @@ update_command() {
     [[ -n "$LATEST_TAG" ]] ||
         die "Could not determine the latest GitHub release."
 
+    echo "TelegramDirect update"
+    echo
     echo "Latest release: $LATEST_TAG"
     echo "Architecture:   linux-$ARCH"
     echo
@@ -169,19 +170,20 @@ update_command() {
         die "SHA-256 checksum verification failed."
     fi
 
-    echo "Checksum verified."
+    echo "SHA-256 checksum verified."
 
     chmod 755 "$TMP_BINARY"
 
-    # Backup current binary before replacement.
-    cp "$BINARY" "$BINARY.backup"
+    BACKUP="$BINARY.backup"
+
+    cp "$BINARY" "$BACKUP"
 
     if ! install -m 755 "$TMP_BINARY" "$BINARY"; then
-        mv "$BINARY.backup" "$BINARY"
+        mv "$BACKUP" "$BINARY"
         die "Failed to install new binary. Previous binary restored."
     fi
 
-    rm -f "$BINARY.backup"
+    rm -f "$BACKUP"
 
     chown root:root "$BINARY"
 
@@ -202,8 +204,8 @@ uninstall_command() {
     echo "========================================"
     echo
 
-    echo "This will remove the TelegramDirect application."
-    echo "The database and persistent data will be asked about separately."
+    echo "This will remove TelegramDirect."
+    echo "Other PM2 applications will not be touched."
     echo
 
     read -rp "Continue? [y/N]: " CONFIRM
@@ -213,37 +215,34 @@ uninstall_command() {
         exit 0
     fi
 
+    detect_manager
+
     echo
-    echo "Stopping services..."
+    echo "Stopping TelegramDirect..."
 
-    # systemd
-    if [[ -f "$SERVICE_FILE" ]]; then
-        systemctl disable --now "$APP_NAME" 2>/dev/null || true
-        rm -f "$SERVICE_FILE"
-        systemctl daemon-reload
-    fi
+    case "$MANAGER" in
+        systemd)
+            systemctl disable --now "$APP_NAME" 2>/dev/null || true
+            rm -f "$SERVICE_FILE"
+            systemctl daemon-reload
+            ;;
 
-    # PM2
-    PM2_HOME="$DATA_DIR/.pm2"
+        pm2)
+            if command -v pm2 >/dev/null 2>&1; then
+                pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+                pm2 save
+            fi
+            ;;
 
-    if command -v pm2 >/dev/null 2>&1 &&
-       id -u "$APP_NAME" >/dev/null 2>&1 &&
-       [[ -d "$PM2_HOME" ]]; then
-
-        runuser -u "$APP_NAME" -- \
-            env PM2_HOME="$PM2_HOME" \
-            pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
-
-        runuser -u "$APP_NAME" -- \
-            env PM2_HOME="$PM2_HOME" \
-            pm2 save >/dev/null 2>&1 || true
-    fi
+        unknown)
+            echo "Process manager could not be detected."
+            ;;
+    esac
 
     echo
     echo "Removing application files..."
 
     rm -rf "$APP_DIR"
-    rm -f /usr/local/bin/telegramdirect
 
     echo
     if [[ -d "$DATA_DIR" ]]; then
@@ -251,7 +250,9 @@ uninstall_command() {
         echo "  $DATA_DIR"
         echo
 
-        read -rp "Delete database and all persistent data? [y/N]: " REMOVE_DATA
+        read -rp \
+            "Delete database and all persistent data? [y/N]: " \
+            REMOVE_DATA
 
         if [[ "$REMOVE_DATA" =~ ^[Yy]$ ]]; then
             rm -rf "$DATA_DIR"
@@ -265,11 +266,14 @@ uninstall_command() {
             echo "Persistent data preserved at:"
             echo "  $DATA_DIR"
         fi
-    else
-        if id -u "$APP_NAME" >/dev/null 2>&1; then
-            userdel "$APP_NAME" 2>/dev/null || true
-        fi
+    elif id -u "$APP_NAME" >/dev/null 2>&1; then
+        userdel "$APP_NAME" 2>/dev/null || true
     fi
+
+    echo
+    echo "Removing TelegramDirect management command..."
+
+    rm -f /usr/local/bin/telegramdirect
 
     echo
     echo "TelegramDirect has been uninstalled."
@@ -295,7 +299,8 @@ Commands:
       checksum, replace the binary and restart the bot.
 
   uninstall
-      Stop TelegramDirect and remove the installation.
+      Stop TelegramDirect and remove its installation.
+      Other PM2 applications are not affected.
       Persistent data is deleted only after confirmation.
 
 EOF

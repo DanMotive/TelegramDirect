@@ -2,10 +2,14 @@
 set -euo pipefail
 
 APP_NAME="suggestion-bot"
+
 APP_DIR="/opt/$APP_NAME"
 DATA_DIR="/var/lib/$APP_NAME"
+
 SERVICE_FILE="/etc/systemd/system/$APP_NAME.service"
-APP_USER="$APP_NAME"
+PM2_CONFIG="$APP_DIR/ecosystem.config.js"
+
+CLI_PATH="/usr/local/bin/telegramdirect"
 
 if [[ "${EUID}" -ne 0 ]]; then
     echo "Run this script as root or with sudo."
@@ -17,8 +21,8 @@ echo " TelegramDirect Uninstaller"
 echo "========================================"
 echo
 
-echo "This will stop TelegramDirect and remove its installed files."
-echo "The SQLite database will NOT be removed unless you explicitly confirm."
+echo "This will remove TelegramDirect."
+echo "Other PM2 applications will NOT be removed."
 echo
 
 read -rp "Continue? [y/N]: " CONFIRM
@@ -29,83 +33,104 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
 fi
 
 echo
+echo "Stopping TelegramDirect..."
 
-# Stop and remove systemd service
-if [[ -f "$SERVICE_FILE" ]] || \
-   systemctl list-unit-files --full --no-legend 2>/dev/null \
-   | awk '{print $1}' \
-   | grep -qx "${APP_NAME}.service"; then
+# ----------------------------------------
+# systemd
+# ----------------------------------------
 
-    echo "Stopping systemd service..."
+if [[ -f "$SERVICE_FILE" ]]; then
+    echo "Found systemd service."
 
     systemctl disable --now "$APP_NAME" 2>/dev/null || true
 
     rm -f "$SERVICE_FILE"
 
     systemctl daemon-reload
+
+    echo "systemd service removed."
 fi
 
-# Stop and remove PM2 process
-PM2_HOME="$DATA_DIR/.pm2"
+# ----------------------------------------
+# Shared PM2
+# ----------------------------------------
 
-if command -v pm2 >/dev/null 2>&1 && \
-   id -u "$APP_USER" >/dev/null 2>&1 && \
-   [[ -d "$PM2_HOME" ]]; then
+if command -v pm2 >/dev/null 2>&1; then
+    echo "Checking shared PM2..."
 
-    echo "Stopping PM2 process..."
+    if pm2 jlist 2>/dev/null |
+        grep -q "\"name\":\"$APP_NAME\""; then
 
-    runuser -u "$APP_USER" -- \
-        env PM2_HOME="$PM2_HOME" \
-        pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+        echo "Removing $APP_NAME from PM2..."
 
-    runuser -u "$APP_USER" -- \
-        env PM2_HOME="$PM2_HOME" \
-        pm2 save >/dev/null 2>&1 || true
+        pm2 delete "$APP_NAME"
+
+        # Save the remaining PM2 applications.
+        pm2 save
+
+        echo "PM2 process removed."
+    else
+        echo "TelegramDirect is not registered in PM2."
+    fi
 fi
+
+# ----------------------------------------
+# Application files
+# ----------------------------------------
+
+echo
+echo "Removing application files..."
+
+if [[ -d "$APP_DIR" ]]; then
+    rm -rf "$APP_DIR"
+    echo "Removed: $APP_DIR"
+else
+    echo "Application directory not found."
+fi
+
+# ----------------------------------------
+# Persistent data
+# ----------------------------------------
 
 echo
 
-# Ask separately about persistent data
-REMOVE_DATA="n"
-
 if [[ -d "$DATA_DIR" ]]; then
-    echo "Persistent data found at:"
+    echo "Persistent data found:"
     echo "  $DATA_DIR"
     echo
 
     read -rp \
-        "Delete SQLite database and all bot data? [y/N]: " \
+        "Delete database and all persistent data? [y/N]: " \
         REMOVE_DATA
-fi
 
-# Remove application files
-if [[ -d "$APP_DIR" ]]; then
-    echo "Removing application files..."
-    rm -rf "$APP_DIR"
-fi
+    if [[ "$REMOVE_DATA" =~ ^[Yy]$ ]]; then
 
-# Remove persistent data only when explicitly confirmed
-if [[ "$REMOVE_DATA" =~ ^[Yy]$ ]]; then
-    echo "Removing bot data..."
-    rm -rf "$DATA_DIR"
+        rm -rf "$DATA_DIR"
+
+        echo "Persistent data removed."
+
+    else
+
+        echo "Persistent data preserved:"
+        echo "  $DATA_DIR"
+    fi
 else
-    echo "Keeping bot data at: $DATA_DIR"
+    echo "No persistent data directory found."
 fi
 
-# Remove dedicated system user only when all data is removed
-if [[ "$REMOVE_DATA" =~ ^[Yy]$ ]] && \
-   id -u "$APP_USER" >/dev/null 2>&1; then
+# ----------------------------------------
+# Management command
+# ----------------------------------------
 
-    echo "Removing system user..."
-    userdel "$APP_USER" 2>/dev/null || true
+echo
+
+if [[ -f "$CLI_PATH" ]]; then
+    rm -f "$CLI_PATH"
+    echo "Removed: $CLI_PATH"
 fi
 
 echo
-echo "Uninstallation complete."
-
-if [[ ! "$REMOVE_DATA" =~ ^[Yy]$ ]]; then
-    echo
-    echo "SQLite data was preserved."
-    echo "Remove it manually with:"
-    echo "  sudo rm -rf $DATA_DIR"
-fi
+echo "========================================"
+echo " TelegramDirect has been uninstalled."
+echo "========================================"
+echo
