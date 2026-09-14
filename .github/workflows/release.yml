@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    name: Build binaries
+    name: Build TelegramDirect
     runs-on: ubuntu-latest
 
     steps:
@@ -21,21 +21,30 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.27"
+          cache: true
 
-      - name: Download dependencies
+      - name: Verify dependencies
         run: go mod download
 
       - name: Build Linux amd64
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-          go build -trimpath -ldflags="-s -w" \
-          -o suggestion-bot-linux-amd64 .
+          CGO_ENABLED=0 \
+          GOOS=linux \
+          GOARCH=amd64 \
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o suggestion-bot-linux-amd64 .
 
       - name: Build Linux arm64
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-          go build -trimpath -ldflags="-s -w" \
-          -o suggestion-bot-linux-arm64 .
+          CGO_ENABLED=0 \
+          GOOS=linux \
+          GOARCH=arm64 \
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o suggestion-bot-linux-arm64 .
 
       - name: Generate checksums
         run: |

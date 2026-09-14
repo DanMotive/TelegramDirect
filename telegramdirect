@@ -4,20 +4,28 @@ set -euo pipefail
 APP_NAME="suggestion-bot"
 APP_DIR="/opt/$APP_NAME"
 DATA_DIR="/var/lib/$APP_NAME"
+
 BINARY="$APP_DIR/$APP_NAME"
+RUNNER="$APP_DIR/run.sh"
+
 ENV_FILE="$APP_DIR/.env"
 CONFIG_FILE="$APP_DIR/config.json"
+
 SERVICE_FILE="/etc/systemd/system/$APP_NAME.service"
 PM2_CONFIG="$APP_DIR/ecosystem.config.js"
+
 REPO="DanMotive/TelegramDirect"
 
 die() {
+    echo
     echo "Error: $*" >&2
     exit 1
 }
 
 require_root() {
-    [[ "${EUID}" -eq 0 ]] || die "Run this command with sudo."
+    if [[ "${EUID}" -ne 0 ]]; then
+        die "Run this command with sudo."
+    fi
 }
 
 detect_arch() {
@@ -56,7 +64,7 @@ detect_manager() {
     MANAGER="unknown"
 }
 
-start_bot() {
+restart_bot() {
     detect_manager
 
     case "$MANAGER" in
@@ -81,104 +89,64 @@ start_bot() {
 config_command() {
     require_root
 
-    mkdir -p "$APP_DIR"
-
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        if [[ -f "$(dirname "$0")/config.example.json" ]]; then
-            cp "$(dirname "$0")/config.example.json" "$CONFIG_FILE"
-        else
-            cat > "$CONFIG_FILE" <<'JSON'
-{
-  "bot": {
-    "name": "TelegramDirect",
-    "welcome_text": "Привет! Здесь можно отправить предложение.",
-    "help_text": "Выбери способ отправки предложения.",
-    "anonymous_button": "🕵️ Анонимно",
-    "named_button": "👤 От своего имени",
-    "cancel_button": "❌ Отмена"
-  },
-  "suggestion": {
-    "ask_text": "Напиши своё предложение:",
-    "anonymous_author": "Анонимно",
-    "max_length": 4000,
-    "too_long_text": "Предложение слишком длинное.",
-    "empty_text": "Предложение не может быть пустым.",
-    "sent_text": "✅ Предложение отправлено на модерацию!"
-  },
-  "moderation": {
-    "title": "📨 Новое предложение",
-    "id_label": "Номер",
-    "author_label": "Автор",
-    "approve_button": "✅ Опубликовать",
-    "reject_button": "❌ Отклонить",
-    "approved_log": "✅ Предложение опубликовано.",
-    "rejected_log": "❌ Предложение отклонено.",
-    "already_processed": "Это предложение уже обработано."
-  },
-  "channel": {
-    "header": "📢 Предложение",
-    "show_author": true,
-    "author_prefix": "👤 Автор:",
-    "anonymous_author": "Аноним"
-  },
-  "errors": {
-    "generic": "Произошла ошибка.",
-    "not_allowed": "У вас нет доступа к этому действию."
-  }
-}
-JSON
-        fi
-    fi
+    [[ -f "$CONFIG_FILE" ]] ||
+        die "config.json was not found: $CONFIG_FILE"
 
     EDITOR="${EDITOR:-nano}"
 
     if ! command -v "$EDITOR" >/dev/null 2>&1; then
-        echo "Editor '$EDITOR' is not installed."
-        echo "Install nano with:"
-        echo "  sudo apt-get install nano"
-        exit 1
+        die "Editor '$EDITOR' is not installed."
     fi
+
+    echo "Opening:"
+    echo "  $CONFIG_FILE"
+    echo
 
     "$EDITOR" "$CONFIG_FILE"
 
     echo
-    echo "Configuration saved to:"
-    echo "  $CONFIG_FILE"
-    echo
-    echo "Restarting bot..."
+    echo "Configuration saved."
 
-    start_bot
+    read -rp "Restart TelegramDirect now? [Y/n]: " RESTART
 
-    echo "Bot restarted."
+    if [[ ! "$RESTART" =~ ^[Nn]$ ]]; then
+        restart_bot
+        echo "Bot restarted."
+    fi
 }
 
 update_command() {
     require_root
     detect_arch
 
-    echo "TelegramDirect update"
-    echo "Architecture: linux-$ARCH"
-    echo
-
     command -v curl >/dev/null 2>&1 ||
         die "curl is required."
+
+    [[ -f "$BINARY" ]] ||
+        die "TelegramDirect is not installed correctly."
 
     LATEST_TAG="$(get_latest_release)"
 
     [[ -n "$LATEST_TAG" ]] ||
-        die "Could not determine latest GitHub release."
+        die "Could not determine the latest GitHub release."
 
     echo "Latest release: $LATEST_TAG"
-
-    RELEASE_URL="https://api.github.com/repos/$REPO/releases/tags/$LATEST_TAG"
+    echo "Architecture:   linux-$ARCH"
+    echo
 
     ASSET="suggestion-bot-linux-$ARCH"
+
     DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$ASSET"
+    CHECKSUM_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/checksums.txt"
 
     TMP_BINARY="$(mktemp)"
     TMP_CHECKSUMS="$(mktemp)"
 
-    trap 'rm -f "$TMP_BINARY" "$TMP_CHECKSUMS"' EXIT
+    cleanup() {
+        rm -f "$TMP_BINARY" "$TMP_CHECKSUMS"
+    }
+
+    trap cleanup EXIT
 
     echo "Downloading binary..."
 
@@ -186,9 +154,7 @@ update_command() {
 
     echo "Downloading checksums..."
 
-    curl -fL \
-        "https://github.com/$REPO/releases/download/$LATEST_TAG/checksums.txt" \
-        -o "$TMP_CHECKSUMS"
+    curl -fL "$CHECKSUM_URL" -o "$TMP_CHECKSUMS"
 
     EXPECTED="$(
         awk -v file="$ASSET" '$2 == file {print $1}' "$TMP_CHECKSUMS"
@@ -203,25 +169,29 @@ update_command() {
         die "SHA-256 checksum verification failed."
     fi
 
-    echo "Checksum OK."
-
-    mkdir -p "$APP_DIR"
+    echo "Checksum verified."
 
     chmod 755 "$TMP_BINARY"
 
-    echo "Installing new binary..."
+    # Backup current binary before replacement.
+    cp "$BINARY" "$BINARY.backup"
 
-    install -m 755 "$TMP_BINARY" "$BINARY"
+    if ! install -m 755 "$TMP_BINARY" "$BINARY"; then
+        mv "$BINARY.backup" "$BINARY"
+        die "Failed to install new binary. Previous binary restored."
+    fi
+
+    rm -f "$BINARY.backup"
+
     chown root:root "$BINARY"
 
-    echo "Restarting bot..."
+    echo "Binary updated."
 
-    start_bot
+    restart_bot
 
     echo
     echo "Update complete."
-    echo "Version:      $LATEST_TAG"
-    echo "Architecture: linux-$ARCH"
+    echo "Version: $LATEST_TAG"
 }
 
 uninstall_command() {
@@ -232,15 +202,19 @@ uninstall_command() {
     echo "========================================"
     echo
 
+    echo "This will remove the TelegramDirect application."
+    echo "The database and persistent data will be asked about separately."
+    echo
+
     read -rp "Continue? [y/N]: " CONFIRM
 
-    [[ "$CONFIRM" =~ ^[Yy]$ ]] || {
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         echo "Cancelled."
         exit 0
-    }
+    fi
 
     echo
-    echo "Stopping TelegramDirect..."
+    echo "Stopping services..."
 
     # systemd
     if [[ -f "$SERVICE_FILE" ]]; then
@@ -252,8 +226,8 @@ uninstall_command() {
     # PM2
     PM2_HOME="$DATA_DIR/.pm2"
 
-    if command -v pm2 >/dev/null 2>&1 && \
-       id -u "$APP_NAME" >/dev/null 2>&1 && \
+    if command -v pm2 >/dev/null 2>&1 &&
+       id -u "$APP_NAME" >/dev/null 2>&1 &&
        [[ -d "$PM2_HOME" ]]; then
 
         runuser -u "$APP_NAME" -- \
@@ -266,31 +240,36 @@ uninstall_command() {
     fi
 
     echo
-    echo "Application files:"
-    echo "  $APP_DIR"
+    echo "Removing application files..."
 
     rm -rf "$APP_DIR"
+    rm -f /usr/local/bin/telegramdirect
 
     echo
-    echo "Persistent data:"
-    echo "  $DATA_DIR"
+    if [[ -d "$DATA_DIR" ]]; then
+        echo "Persistent data found:"
+        echo "  $DATA_DIR"
+        echo
 
-    read -rp "Delete database and all persistent data? [y/N]: " REMOVE_DATA
+        read -rp "Delete database and all persistent data? [y/N]: " REMOVE_DATA
 
-    if [[ "$REMOVE_DATA" =~ ^[Yy]$ ]]; then
-        rm -rf "$DATA_DIR"
+        if [[ "$REMOVE_DATA" =~ ^[Yy]$ ]]; then
+            rm -rf "$DATA_DIR"
 
+            if id -u "$APP_NAME" >/dev/null 2>&1; then
+                userdel "$APP_NAME" 2>/dev/null || true
+            fi
+
+            echo "Persistent data removed."
+        else
+            echo "Persistent data preserved at:"
+            echo "  $DATA_DIR"
+        fi
+    else
         if id -u "$APP_NAME" >/dev/null 2>&1; then
             userdel "$APP_NAME" 2>/dev/null || true
         fi
-
-        echo "Database and persistent data removed."
-    else
-        echo "Persistent data preserved."
     fi
-
-    # Remove command itself
-    rm -f /usr/local/bin/telegramdirect
 
     echo
     echo "TelegramDirect has been uninstalled."
@@ -304,24 +283,25 @@ Usage:
   telegramdirect config
   telegramdirect update
   telegramdirect uninstall
+  telegramdirect help
 
 Commands:
 
   config
-      Edit config.json and restart the bot.
+      Edit config.json and optionally restart the bot.
 
   update
       Download the latest GitHub Release, verify its SHA-256
-      checksum and restart the bot.
+      checksum, replace the binary and restart the bot.
 
   uninstall
-      Stop the bot and remove the installation.
+      Stop TelegramDirect and remove the installation.
       Persistent data is deleted only after confirmation.
 
 EOF
 }
 
-case "${1:-}" in
+case "${1:-help}" in
     config)
         config_command
         ;;
@@ -334,7 +314,7 @@ case "${1:-}" in
         uninstall_command
         ;;
 
-    help|-h|--help|"")
+    help|--help|-h)
         show_help
         ;;
 

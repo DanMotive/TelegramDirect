@@ -2,13 +2,32 @@
 set -euo pipefail
 
 REPO="DanMotive/TelegramDirect"
+
 APP_NAME="suggestion-bot"
 APP_DIR="/opt/$APP_NAME"
 DATA_DIR="/var/lib/$APP_NAME"
+
 BINARY="$APP_DIR/$APP_NAME"
+RUNNER="$APP_DIR/run.sh"
+
+ENV_FILE="$APP_DIR/.env"
+CONFIG_FILE="$APP_DIR/config.json"
+
 SERVICE_FILE="/etc/systemd/system/$APP_NAME.service"
 PM2_CONFIG="$APP_DIR/ecosystem.config.js"
-ENV_FILE="$APP_DIR/.env"
+
+CLI_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/telegramdirect"
+CONFIG_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config.example.json"
+
+if [[ "${EUID}" -ne 0 ]]; then
+    echo "Run this script as root or with sudo."
+    exit 1
+fi
+
+echo "========================================"
+echo " TelegramDirect Bot Installer"
+echo "========================================"
+echo
 
 case "$(uname -m)" in
     x86_64)
@@ -23,25 +42,22 @@ case "$(uname -m)" in
         ;;
 esac
 
-if [[ "${EUID}" -ne 0 ]]; then
-    echo "Run this script as root or with sudo."
+echo "Detected architecture: linux-$ARCH"
+echo
+
+if [[ ! -f "$CONFIG_SOURCE" ]]; then
+    echo "config.example.json was not found."
+    echo "Run the installer from the TelegramDirect project directory."
     exit 1
 fi
-if [[ -f ./telegramdirect ]]; then
-    install -m 755 ./telegramdirect /usr/local/bin/telegramdirect
-else
-    echo "Warning: telegramdirect CLI script not found."
+
+if [[ ! -f "$CLI_SOURCE" ]]; then
+    echo "telegramdirect CLI script was not found."
+    echo "Run the installer from the TelegramDirect project directory."
+    exit 1
 fi
-echo "========================================"
-echo " TelegramDirect Bot Installer"
-echo "========================================"
-echo
 
-echo "Detected architecture: $ARCH"
-echo
-
-echo "Telegram IDs can be viewed in Telegram Desktop by enabling Developer Mode."
-echo "Typical channel/group IDs look like -1001234567890."
+echo "Telegram IDs can be viewed in Telegram Desktop Developer Mode."
 echo
 
 read -rsp "Telegram Bot Token: " BOT_TOKEN
@@ -55,18 +71,26 @@ echo
 echo "Process manager:"
 echo "  1) systemd (recommended)"
 echo "  2) PM2"
+
 read -rp "Choose [1-2]: " PROCESS_MANAGER
 
 case "$PROCESS_MANAGER" in
-    1) PROCESS_MANAGER="systemd" ;;
-    2) PROCESS_MANAGER="pm2" ;;
+    1)
+        PROCESS_MANAGER="systemd"
+        ;;
+    2)
+        PROCESS_MANAGER="pm2"
+        ;;
     *)
         echo "Invalid choice."
         exit 1
         ;;
 esac
 
-if [[ -z "$BOT_TOKEN" || -z "$ADMIN_CHAT_ID" || -z "$CHANNEL_ID" || -z "$ADMIN_IDS" ]]; then
+if [[ -z "$BOT_TOKEN" ||
+      -z "$ADMIN_CHAT_ID" ||
+      -z "$CHANNEL_ID" ||
+      -z "$ADMIN_IDS" ]]; then
     echo "All fields are required."
     exit 1
 fi
@@ -93,10 +117,40 @@ for id in "${IDS[@]}"; do
 done
 
 echo
-echo "Checking latest TelegramDirect release..."
-install -m 755 telegramdirect /usr/local/bin/telegramdirect
+echo "Repository:     $REPO"
+echo "Architecture:   linux-$ARCH"
+echo "Manager:        $PROCESS_MANAGER"
+echo
+
+read -rp "Continue installation? [y/N]: " CONFIRM
+
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Cancelled."
+    exit 0
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo
+echo "Installing required packages..."
+
 apt-get update
-apt-get install -y ca-certificates curl sqlite3
+apt-get install -y ca-certificates curl
+
+if [[ "$PROCESS_MANAGER" == "pm2" ]]; then
+    if ! command -v pm2 >/dev/null 2>&1; then
+        echo "PM2 is not installed."
+
+        if ! command -v npm >/dev/null 2>&1; then
+            apt-get install -y nodejs npm
+        fi
+
+        npm install -g pm2
+    fi
+fi
+
+echo
+echo "Checking latest GitHub release..."
 
 LATEST_TAG="$(
     curl -fsSL \
@@ -107,41 +161,58 @@ LATEST_TAG="$(
 )"
 
 if [[ -z "$LATEST_TAG" ]]; then
-    echo "Failed to determine the latest release."
-    echo "Make sure the repository has at least one GitHub Release."
+    echo "Failed to determine latest release."
     exit 1
 fi
 
 echo "Latest release: $LATEST_TAG"
 
-DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/suggestion-bot-linux-$ARCH"
+ASSET="suggestion-bot-linux-$ARCH"
 
-echo "Downloading:"
-echo "$DOWNLOAD_URL"
+DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/$ASSET"
+CHECKSUM_URL="https://github.com/$REPO/releases/download/$LATEST_TAG/checksums.txt"
+
+TMP_BINARY="$(mktemp)"
+TMP_CHECKSUMS="$(mktemp)"
+
+cleanup() {
+    rm -f "$TMP_BINARY" "$TMP_CHECKSUMS"
+}
+
+trap cleanup EXIT
+
 echo
+echo "Downloading binary..."
+echo "$DOWNLOAD_URL"
 
-if ! curl -fL "$DOWNLOAD_URL" -o /tmp/"$APP_NAME"; then
-    echo
-    echo "Failed to download the TelegramDirect binary."
-    echo "Make sure release $LATEST_TAG contains:"
-    echo "  suggestion-bot-linux-$ARCH"
+curl -fL "$DOWNLOAD_URL" -o "$TMP_BINARY"
+
+echo "Downloading checksums..."
+
+curl -fL "$CHECKSUM_URL" -o "$TMP_CHECKSUMS"
+
+EXPECTED="$(
+    awk -v file="$ASSET" '$2 == file {print $1}' "$TMP_CHECKSUMS"
+)"
+
+if [[ -z "$EXPECTED" ]]; then
+    echo "Checksum for $ASSET was not found."
     exit 1
 fi
 
-echo "Binary downloaded successfully."
+ACTUAL="$(sha256sum "$TMP_BINARY" | awk '{print $1}')"
 
-if [[ "$PROCESS_MANAGER" == "pm2" ]] && ! command -v pm2 >/dev/null 2>&1; then
-    echo
-    echo "PM2 is not installed. Installing Node.js and PM2..."
-
-    if ! command -v npm >/dev/null 2>&1; then
-        apt-get install -y nodejs npm
-    fi
-
-    npm install -g pm2
+if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+    echo "SHA-256 verification failed."
+    echo "Expected: $EXPECTED"
+    echo "Actual:   $ACTUAL"
+    exit 1
 fi
 
+echo "SHA-256 verification successful."
+
 if ! id -u "$APP_NAME" >/dev/null 2>&1; then
+    echo
     echo "Creating system user: $APP_NAME"
 
     useradd \
@@ -151,51 +222,77 @@ if ! id -u "$APP_NAME" >/dev/null 2>&1; then
         "$APP_NAME"
 fi
 
-mkdir -p "$APP_DIR" "$DATA_DIR"
+mkdir -p "$APP_DIR"
+mkdir -p "$DATA_DIR"
 
-# Install binary
-install -m 755 /tmp/"$APP_NAME" "$BINARY"
-rm -f /tmp/"$APP_NAME"
+echo
+echo "Installing binary..."
 
+install -m 755 "$TMP_BINARY" "$BINARY"
 chown root:root "$BINARY"
 
-# Environment file
+echo "Installing CLI..."
+
+install -m 755 "$CLI_SOURCE" /usr/local/bin/telegramdirect
+
+echo "Creating runner..."
+
+cat > "$RUNNER" <<'RUNNER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_DIR="/opt/suggestion-bot"
+ENV_FILE="$APP_DIR/.env"
+BINARY="$APP_DIR/suggestion-bot"
+
+set -a
+source "$ENV_FILE"
+set +a
+
+exec "$BINARY"
+RUNNER
+
+chown root:root "$RUNNER"
+chmod 755 "$RUNNER"
+
+echo
+echo "Creating environment configuration..."
+
 cat > "$ENV_FILE" <<ENV
 BOT_TOKEN=$BOT_TOKEN
 ADMIN_CHAT_ID=$ADMIN_CHAT_ID
 CHANNEL_ID=$CHANNEL_ID
 ADMIN_IDS=$ADMIN_IDS
 DB_PATH=$DATA_DIR/data.db
+CONFIG_PATH=$CONFIG_FILE
 ENV
 
 chown root:"$APP_NAME" "$ENV_FILE"
 chmod 640 "$ENV_FILE"
 
-# Database directory
+echo
+echo "Creating config.json..."
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    cp "$CONFIG_SOURCE" "$CONFIG_FILE"
+    chown root:"$APP_NAME" "$CONFIG_FILE"
+    chmod 640 "$CONFIG_FILE"
+else
+    echo "Existing config.json preserved."
+fi
+
 chown "$APP_NAME":"$APP_NAME" "$DATA_DIR"
 chmod 750 "$DATA_DIR"
 
-echo
-echo "========================================"
-echo " Installation"
-echo "========================================"
-echo
-
-read -rp "Install/update $APP_NAME with these settings? [y/N]: " CONFIRM
-
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo "Cancelled."
-    exit 0
-fi
-
 if [[ "$PROCESS_MANAGER" == "systemd" ]]; then
 
+    echo
     echo "Configuring systemd..."
 
-    # Stop old PM2 instance if one exists.
-    if command -v pm2 >/dev/null 2>&1 && \
-       [[ -d "$DATA_DIR/.pm2" ]] && \
-       id -u "$APP_NAME" >/dev/null 2>&1; then
+    # Remove old PM2 process if switching from PM2.
+    if command -v pm2 >/dev/null 2>&1 &&
+       id -u "$APP_NAME" >/dev/null 2>&1 &&
+       [[ -d "$DATA_DIR/.pm2" ]]; then
 
         PM2_HOME="$DATA_DIR/.pm2"
 
@@ -219,6 +316,7 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$BINARY
 Restart=on-failure
 RestartSec=5
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -231,17 +329,14 @@ SERVICE
 
     systemctl daemon-reload
     systemctl enable "$APP_NAME"
-
-    # Restart if service already existed, otherwise start it.
     systemctl restart "$APP_NAME"
-
-    MANAGER_INFO="systemd"
 
 else
 
+    echo
     echo "Configuring PM2..."
 
-    # Remove old systemd service if present.
+    # Remove old systemd service if switching from systemd.
     if [[ -f "$SERVICE_FILE" ]]; then
         systemctl disable --now "$APP_NAME" 2>/dev/null || true
         rm -f "$SERVICE_FILE"
@@ -257,17 +352,9 @@ else
 module.exports = {
     apps: [{
         name: "$APP_NAME",
-        script: "$BINARY",
-        interpreter: "none",
+        script: "$RUNNER",
+        interpreter: "/bin/bash",
         cwd: "$APP_DIR",
-
-        env: {
-            BOT_TOKEN: "$BOT_TOKEN",
-            ADMIN_CHAT_ID: "$ADMIN_CHAT_ID",
-            CHANNEL_ID: "$CHANNEL_ID",
-            ADMIN_IDS: "$ADMIN_IDS",
-            DB_PATH: "$DATA_DIR/data.db"
-        },
 
         autorestart: true,
         restart_delay: 5000,
@@ -291,6 +378,9 @@ PM2
         env PM2_HOME="$PM2_HOME" \
         pm2 save
 
+    echo
+    echo "Generating PM2 startup configuration..."
+
     runuser -u "$APP_NAME" -- \
         env PM2_HOME="$PM2_HOME" \
         pm2 startup systemd \
@@ -301,15 +391,15 @@ PM2
     MANAGER_INFO="PM2"
 fi
 
-echo
-echo "Checking bot status..."
 sleep 2
 
+echo
+echo "Checking bot status..."
+
 if [[ "$PROCESS_MANAGER" == "systemd" ]]; then
-
     RUNNING="$(systemctl is-active "$APP_NAME" 2>/dev/null || true)"
-
 else
+    PM2_HOME="$DATA_DIR/.pm2"
 
     RUNNING="$(
         runuser -u "$APP_NAME" -- \
@@ -319,7 +409,6 @@ else
         echo online ||
         true
     )"
-
 fi
 
 if [[ "$RUNNING" == "active" || "$RUNNING" == "online" ]]; then
@@ -330,42 +419,42 @@ if [[ "$RUNNING" == "active" || "$RUNNING" == "online" ]]; then
     echo "========================================"
     echo
 
-    echo "Version:        $LATEST_TAG"
-    echo "Architecture:   linux-$ARCH"
-    echo "Process manager: $MANAGER_INFO"
-    echo "Binary:         $BINARY"
-    echo "Database:       $DATA_DIR/data.db"
+    echo "Version:         $LATEST_TAG"
+    echo "Architecture:    linux-$ARCH"
+    echo "Process manager: $PROCESS_MANAGER"
+    echo "Binary:          $BINARY"
+    echo "Config:          $CONFIG_FILE"
+    echo "Database:        $DATA_DIR/data.db"
+    echo
+    echo "Management:"
+    echo "  telegramdirect config"
+    echo "  telegramdirect update"
+    echo "  telegramdirect uninstall"
     echo
 
     if [[ "$PROCESS_MANAGER" == "systemd" ]]; then
-
         echo "Status:"
         echo "  systemctl status $APP_NAME"
         echo
-
         echo "Logs:"
         echo "  journalctl -u $APP_NAME -f"
-
     else
-
         echo "Status:"
         echo "  runuser -u $APP_NAME -- env PM2_HOME=$PM2_HOME pm2 status"
         echo
-
         echo "Logs:"
         echo "  runuser -u $APP_NAME -- env PM2_HOME=$PM2_HOME pm2 logs $APP_NAME"
 
-        if [[ -s /tmp/${APP_NAME}-pm2-startup.txt ]]; then
+        if [[ -s "/tmp/${APP_NAME}-pm2-startup.txt" ]]; then
             echo
-            echo "PM2 startup instructions were saved to:"
-            echo "  /tmp/${APP_NAME}-pm2-startup.txt"
+            echo "PM2 startup instructions:"
             echo
-            cat /tmp/${APP_NAME}-pm2-startup.txt || true
+            cat "/tmp/${APP_NAME}-pm2-startup.txt" || true
         fi
     fi
 
     echo
-    echo "No inbound port is required."
+    echo "No inbound HTTP port is required."
     echo "The bot uses Telegram long polling."
     echo
 
@@ -376,10 +465,10 @@ else
     echo
 
     if [[ "$PROCESS_MANAGER" == "systemd" ]]; then
-        echo "Check:"
+        echo "Logs:"
         echo "  journalctl -u $APP_NAME -n 50 --no-pager"
     else
-        echo "Check:"
+        echo "Logs:"
         echo "  runuser -u $APP_NAME -- env PM2_HOME=$PM2_HOME pm2 logs $APP_NAME --lines 50"
     fi
 
