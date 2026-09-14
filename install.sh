@@ -364,7 +364,7 @@ fi
 sleep 2
 
 echo
-echo "Checking bot status..."
+echo "Checking bot status... if it does not start, press ctrl + c and check the telegram"
 
 if [[ "$PROCESS_MANAGER" == "systemd" ]]; then
     RUNNING="$(systemctl is-active "$APP_NAME" 2>/dev/null || true)"
