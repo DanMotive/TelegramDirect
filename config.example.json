@@ -1,0 +1,69 @@
+{
+  "bot": {
+    "name": "TelegramDirect",
+    "welcome_text": "Hello! You can send a suggestion here.",
+    "help_text": "Choose how you want to submit your suggestion.",
+    "anonymous_button": "🕵️ Anonymous",
+    "named_button": "👤 With my name",
+    "cancel_button": "❌ Cancel",
+    "unknown_command": "Use /suggest to send a suggestion."
+  },
+
+  "suggestion": {
+    "ask_text": "✍️ Now send your suggestion. Selected mode: %s.",
+    "mode_anonymous": "anonymous",
+    "mode_named": "with my name",
+    "mode_selected": "Mode: %s",
+    "empty_text": "The suggestion cannot be empty.",
+    "too_long_text": "The suggestion is too long. Maximum: %d characters.",
+    "sent_text": "✅ Your suggestion has been sent for moderation.",
+    "no_mode_text": "First choose a submission mode using /suggest.",
+    "cancel_text": "❌ Submission cancelled.",
+    "anonymous_author": "Anonymous",
+    "max_length": 4000
+  },
+
+  "moderation": {
+    "title": "📩 New Suggestion",
+    "id_label": "ID",
+    "author_label": "Author",
+    "text_label": "Text",
+    "anonymous_author": "Anonymous",
+    "named_fallback": "User without username",
+    "approve_button": "✅ Publish",
+    "reject_button": "❌ Reject",
+    "approved_log": "✅ Suggestion #%d was published by %s (ID %d).",
+    "rejected_log": "❌ Suggestion #%d was rejected by %s (ID %d).",
+    "already_processed": "This suggestion has already been processed.",
+    "not_found": "Suggestion not found.",
+    "invalid_id": "Invalid suggestion ID.",
+    "no_permission": "You do not have permission to do this.",
+    "published_callback": "Published",
+    "rejected_callback": "Rejected"
+  },
+
+  "channel": {
+    "header": "📢 Suggestion",
+    "show_id": false,
+    "show_author": true,
+    "author_prefix": "👤 Author:",
+    "anonymous_author": "Anonymous"
+  },
+
+  "admin": {
+    "queue_title": "📋 Suggestion Queue",
+    "queue_item": "#%d — %s\n%s",
+    "queue_empty": "The queue is empty.",
+    "help_text": "Commands:\n/queue — show the suggestion queue\n/help — show this help message",
+    "published_log": "✅ Suggestion #%d was published by %s (ID %d).",
+    "rejected_log": "❌ Suggestion #%d was rejected by %s (ID %d)."
+  },
+
+  "errors": {
+    "generic": "Something went wrong. Please try again.",
+    "not_allowed": "You do not have access to this action.",
+    "unavailable": "This message is no longer available.",
+    "invalid_action": "Invalid action.",
+    "invalid_mode": "Invalid submission mode."
+  }
+}
